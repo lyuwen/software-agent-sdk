@@ -159,7 +159,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         ),
     )
     top_p: float | None = Field(default=1.0, ge=0, le=1)
-    top_k: float | None = Field(default=None, ge=0)
+    top_k: int | None = Field(default=None, ge=0)
 
     max_input_tokens: int | None = Field(
         default=None,
