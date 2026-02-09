@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import os
 
 
 def model_matches(model: str, patterns: list[str]) -> bool:
@@ -157,20 +158,45 @@ SEND_REASONING_CONTENT_MODELS: list[str] = [
 ]
 
 
+def _get_env_override(feature_name: str) -> bool | None:
+    """Check for environment variable override for a given feature.
+
+    Env var name format: OH_<FEATURE_NAME_UPPER>
+    Values: "1", "true", "yes" -> True; "0", "false", "no" -> False.
+    """
+    env_var_name = f"OH_{feature_name.upper()}"
+    val = os.getenv(env_var_name)
+    if val is None:
+        return None
+    val = val.lower().strip()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
 def get_features(model: str) -> ModelFeatures:
     """Get model features."""
+    
+    def _resolve(feature_name: str, default_val: bool) -> bool:
+         override = _get_env_override(feature_name)
+         if override is not None:
+             return override
+         return default_val
+
     return ModelFeatures(
-        supports_reasoning_effort=model_matches(model, REASONING_EFFORT_MODELS),
-        supports_extended_thinking=model_matches(model, EXTENDED_THINKING_MODELS),
-        supports_prompt_cache=model_matches(model, PROMPT_CACHE_MODELS),
-        supports_stop_words=not model_matches(model, SUPPORTS_STOP_WORDS_FALSE_MODELS),
-        supports_responses_api=model_matches(model, RESPONSES_API_MODELS),
-        force_string_serializer=model_matches(model, FORCE_STRING_SERIALIZER_MODELS),
-        send_reasoning_content=model_matches(model, SEND_REASONING_CONTENT_MODELS),
+        supports_reasoning_effort=_resolve("supports_reasoning_effort", model_matches(model, REASONING_EFFORT_MODELS)),
+        supports_extended_thinking=_resolve("supports_extended_thinking", model_matches(model, EXTENDED_THINKING_MODELS)),
+        supports_prompt_cache=_resolve("supports_prompt_cache", model_matches(model, PROMPT_CACHE_MODELS)),
+        supports_stop_words=_resolve("supports_stop_words", not model_matches(model, SUPPORTS_STOP_WORDS_FALSE_MODELS)),
+        supports_responses_api=_resolve("supports_responses_api", model_matches(model, RESPONSES_API_MODELS)),
+        force_string_serializer=_resolve("force_string_serializer", model_matches(model, FORCE_STRING_SERIALIZER_MODELS)),
+        send_reasoning_content=_resolve("send_reasoning_content", model_matches(model, SEND_REASONING_CONTENT_MODELS)),
         # Extended prompt_cache_retention support follows ordered include/exclude rules.
-        supports_prompt_cache_retention=apply_ordered_model_rules(
+        supports_prompt_cache_retention=_resolve("supports_prompt_cache_retention", apply_ordered_model_rules(
             model, PROMPT_CACHE_RETENTION_MODELS
-        ),
+        )),
     )
 
 
