@@ -22,7 +22,7 @@ def select_chat_options(
         "max_completion_tokens": llm.max_output_tokens,
     }
     out = apply_defaults_if_absent(user_kwargs, defaults)
-    if isinstance(out["top_k"], float):
+    if isinstance(out.get("top_k"), float):
         out["top_k"] = int(out["top_k"])
 
     # Azure -> uses max_tokens instead
