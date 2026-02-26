@@ -41,6 +41,28 @@ VALID_TARGETS = {"binary", "binary-minimal", "source", "source-minimal"}
 # --- helpers ---
 
 
+def docker_image_exists(image: str) -> bool:
+    """
+    Check if a Docker image (including tag) exists locally.
+
+    Args:
+        image: Image name with optional tag, e.g. "nginx:latest"
+
+    Returns:
+        True if the image exists locally, False otherwise.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        raise RuntimeError("Docker CLI not found. Is Docker installed?")
+
+
 def _default_sdk_project_root() -> Path:
     """
     Resolve top-level OpenHands UV workspace root:
@@ -548,6 +570,8 @@ def build(opts: BuildOptions) -> list[str]:
     for t in tags:
         args += ["--tag", t]
 
+    tags_exists = all([docker_image_exists(t) for t in tags])
+
     # -------- cache strategy --------
     driver = _active_buildx_driver() or "unknown"
     local_cache_dir = _default_local_cache_dir()
@@ -606,8 +630,11 @@ def build(opts: BuildOptions) -> list[str]:
     logger.info(f"[build] Cache tag: {cache_tag}")
 
     try:
-        res = _run(args, cwd=str(ctx))
-        sys.stdout.write(res.stdout or "")
+        if not tags_exists:
+            res = _run(args, cwd=str(ctx))
+            sys.stdout.write(res.stdout or "")
+        else:
+            logger.info(f"[build] Tags already exist {tags}, skip build.")
     except subprocess.CalledProcessError as e:
         logger.error(f"[build] ERROR: Build failed with exit code {e.returncode}")
         logger.error(f"[build] Command: {' '.join(e.cmd)}")
