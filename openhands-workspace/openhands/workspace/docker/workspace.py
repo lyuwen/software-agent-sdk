@@ -112,6 +112,10 @@ class DockerWorkspace(RemoteWorkspace):
         default=False,
         description="Whether to delete the Docker image when cleaning up workspace.",
     )
+    bind_volumes: bool = Field(
+        defaultfactory=list,
+        description="Bind extra directories to container workspace.",
+    )
 
     _container_id: str | None = PrivateAttr(default=None)
     _image_name: str | None = PrivateAttr(default=None)
@@ -198,6 +202,10 @@ class DockerWorkspace(RemoteWorkspace):
             logger.info(
                 f"Mounting host dir {self.mount_dir} to container path {mount_path}"
             )
+
+        if self.bind_volumes:
+            for volume in self.bind_volumes:
+                flags += ["-v", volume]
 
         ports = ["-p", f"{self.host_port}:8000"]
         if self.extra_ports:
