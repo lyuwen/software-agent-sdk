@@ -19,6 +19,7 @@ Notes:
 """
 
 from .default import get_default_agent
+from .legacy import get_legacy_agent
 from .gemini import get_gemini_agent, get_gemini_tools
 from .gpt5 import get_gpt5_agent
 from .planning import get_planning_agent
@@ -26,6 +27,7 @@ from .planning import get_planning_agent
 
 __all__ = [
     "get_default_agent",
+    "get_legacy_agent",
     "get_gemini_agent",
     "get_gemini_tools",
     "get_gpt5_agent",

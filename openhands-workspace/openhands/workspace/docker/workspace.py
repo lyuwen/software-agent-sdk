@@ -112,7 +112,7 @@ class DockerWorkspace(RemoteWorkspace):
         default=False,
         description="Whether to delete the Docker image when cleaning up workspace.",
     )
-    bind_volumes: bool = Field(
+    bind_volumes: list[str] = Field(
         defaultfactory=list,
         description="Bind extra directories to container workspace.",
     )

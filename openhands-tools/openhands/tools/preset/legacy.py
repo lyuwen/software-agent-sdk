@@ -25,16 +25,17 @@ class ExecuteBashTool(TerminalTool):
   pass
 
 
+register_tool(StrReplaceEditorTool.name, StrReplaceEditorTool)
+register_tool(ExecuteBashTool.name, ExecuteBashTool)
+
+
 def register_legacy_tools(enable_browser: bool = True) -> None:
     """Register the legacy set of tools."""
     # Tools are now automatically registered when imported
 
-    logger.debug(f"Tool: {TerminalTool.name} registered.")
-    logger.debug(f"Tool: {FileEditorTool.name} registered.")
     logger.debug(f"Tool: {TaskTrackerTool.name} registered.")
-
-    register_tool("str_replace_editor", StrReplaceEditorTool)
-    register_tool("execute_bash", ExecuteBashTool)
+    logger.debug(f"Tool: {StrReplaceEditorTool.name} registered.")
+    logger.debug(f"Tool: {ExecuteBashTool.name} registered.")
 
     if enable_browser:
         raise NotImplementedError("Legacy brower use not supported")
@@ -51,8 +52,8 @@ def get_legacy_tools(
     register_legacy_tools(enable_browser=enable_browser)
 
     tools = [
-        Tool(name="execute_bash"),
-        Tool(name="str_replace_editor"),
+        Tool(name=StrReplaceEditorTool.name),
+        Tool(name=ExecuteBashTool.name),
         Tool(name=TaskTrackerTool.name),
     ]
     if enable_browser:
