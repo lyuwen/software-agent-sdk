@@ -29,43 +29,24 @@ from openhands.sdk.tool import (
 if TYPE_CHECKING:
     from openhands.sdk.conversation.state import ConversationState
 
-
 # ---------------------------------------------------------------------------
-# Naming convention mapping
+# Naming convention — single source of truth is lsp_tool.py
 # ---------------------------------------------------------------------------
-COMMAND_NAMES = {
-    # snake_case → camelCase
-    "get_definition": "goToDefinition",
-    "get_type_definition": "goToTypeDefinition",
-    "find_references": "findReferences",
-    "hover": "hover",
-    "get_implementation": "goToImplementation",
-    "get_call_hierarchy": "getCallHierarchy",
-    "prepare_call_hierarchy": "prepareCallHierarchy",
-    "incoming_calls": "incomingCalls",
-    "outgoing_calls": "outgoingCalls",
-    "get_document_symbols": "getDocumentSymbols",
-    "get_workspace_symbols": "getWorkspaceSymbols",
-    "get_document_highlights": "getDocumentHighlights",
-}
-CAMEL_TO_SNAKE = {v: k for k, v in COMMAND_NAMES.items()}
-_ALIASES = {"get_hover": "hover", "get_references": "find_references"}
-
-LSP_NAMING = os.environ.get("LSP_NAMING", "snake_case")
-
-SNAKE_COMMANDS = list(COMMAND_NAMES.keys())
-CAMEL_COMMANDS = list(COMMAND_NAMES.values())
+from openhands.tools.lsp.lsp_tool import (
+    COMMAND_NAMES,
+    CAMEL_TO_SNAKE,
+    _ALIASES,
+    normalize_command,
+)
 
 
-def normalize_command(cmd: str) -> str:
-    """Normalize any command name to canonical snake_case."""
-    if cmd in COMMAND_NAMES:
-        return cmd
-    if cmd in CAMEL_TO_SNAKE:
-        return CAMEL_TO_SNAKE[cmd]
-    if cmd in _ALIASES:
-        return _ALIASES[cmd]
-    return cmd
+def _command_enum_schema(schema: dict) -> None:
+    """Callable json_schema_extra: resolve the command enum at schema-generation time."""
+    naming = os.environ.get("LSP_NAMING", "camelCase")
+    if naming == "camelCase":
+        schema["enum"] = list(COMMAND_NAMES.values())
+    else:
+        schema["enum"] = list(COMMAND_NAMES.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -86,9 +67,7 @@ class LSPAction(Action):
             "Use get_document_symbols for a file outline. "
             "Use get_workspace_symbols to search symbols project-wide."
         ),
-        json_schema_extra={
-            "enum": CAMEL_COMMANDS if LSP_NAMING == "camelCase" else SNAKE_COMMANDS,
-        },
+        json_schema_extra=_command_enum_schema,
     )
     file_path: str | None = Field(
         default=None,
@@ -257,7 +236,12 @@ class LSPTool(ToolDefinition[LSPAction, LSPObservation]):
         cls,
         conv_state: "ConversationState",
         terminal_executor: "ToolExecutor | None" = None,
+        lsp_naming: str | None = None,
     ) -> Sequence["LSPTool"]:
+        # Allow explicit naming override via Tool(params={"lsp_naming": "camelCase"})
+        if lsp_naming is not None:
+            os.environ["LSP_NAMING"] = lsp_naming
+
         if terminal_executor is None:
             from openhands.tools.terminal.impl import TerminalExecutor
 
