@@ -191,38 +191,58 @@ class LSPToolExecutor(ToolExecutor[LSPAction, LSPObservation]):
 # ---------------------------------------------------------------------------
 # Tool description (what the LLM sees)
 # ---------------------------------------------------------------------------
-LSP_TOOL_DESCRIPTION = """\
-Code intelligence tool powered by Pyright Language Server. Provides semantic, \
-AST-based understanding of Python code — far more accurate than grep for \
-navigating and understanding code structure.
 
-### Commands
+# Per-command metadata: (snake_case_key, description, required_args)
+_COMMAND_TABLE = [
+    ("get_definition", "Jump to where a symbol is defined; returns full source code", "file_path, line, symbol"),
+    ("get_type_definition", "Jump to the type's definition with source code", "file_path, line, symbol"),
+    ("find_references", "Find all usages of a symbol across the project", "file_path, line, symbol"),
+    ("hover", "Get docstring, inferred type, and signature", "file_path, line, symbol"),
+    ("get_implementation", "Find implementations of an interface/abstract method", "file_path, line, symbol"),
+    ("get_call_hierarchy", "Who calls this function, and what does it call? (combined)", "file_path, line, symbol"),
+    ("prepare_call_hierarchy", "Get a call hierarchy item for a symbol (step 1)", "file_path, line, symbol"),
+    ("incoming_calls", "Who calls this function? (requires item from prepare)", "item"),
+    ("outgoing_calls", "What does this function call? (requires item from prepare)", "item"),
+    ("get_document_symbols", "List all symbols in a file (classes, functions, vars)", "file_path"),
+    ("get_workspace_symbols", "Search for a symbol name across the entire project", "query"),
+    ("get_document_highlights", "Find all usages of a symbol within one file", "file_path, line, symbol"),
+]
 
-| Command | What it does | Required args |
-|---|---|---|
-| `get_definition` | Jump to where a symbol is defined; returns full source code | file_path, line, symbol |
-| `get_type_definition` | Jump to the type's definition with source code | file_path, line, symbol |
-| `find_references` | Find all usages of a symbol across the project | file_path, line, symbol |
-| `hover` | Get docstring, inferred type, and signature | file_path, line, symbol |
-| `get_implementation` | Find implementations of an interface/abstract method | file_path, line, symbol |
-| `get_call_hierarchy` | Who calls this function, and what does it call? (combined) | file_path, line, symbol |
-| `prepare_call_hierarchy` | Get a call hierarchy item for a symbol (step 1) | file_path, line, symbol |
-| `incoming_calls` | Who calls this function? (requires item from prepare) | item |
-| `outgoing_calls` | What does this function call? (requires item from prepare) | item |
-| `get_document_symbols` | List all symbols in a file (classes, functions, vars) | file_path |
-| `get_workspace_symbols` | Search for a symbol name across the entire project | query |
-| `get_document_highlights` | Find all usages of a symbol within one file | file_path, line, symbol |
 
-### Tips
-- Use `get_document_symbols` to understand a file's structure before reading it
-- Use `get_workspace_symbols` to find where something is defined across the project
-- Use `get_definition` to jump to and read the actual source code of any symbol
-- Use `find_references` to understand how widely a function or class is used
-- Use `get_call_hierarchy` for a quick combined view of callers + callees
-- For fine-grained control, use `prepare_call_hierarchy` then `incoming_calls`/`outgoing_calls`
-- `line` is 1-indexed (matches what you see in file editors)
-- `symbol` is just the identifier name (e.g., `MyClass`, `my_function`, `my_var`)
-"""
+def _build_tool_description(naming: str = "camelCase") -> str:
+    """Build the tool description with command names matching *naming*."""
+    use_camel = naming == "camelCase"
+
+    rows = []
+    for snake, desc, args in _COMMAND_TABLE:
+        display = COMMAND_NAMES[snake] if use_camel else snake
+        rows.append(f"| `{display}` | {desc} | {args} |")
+    table = "\n".join(rows)
+
+    def _cmd(snake: str) -> str:
+        return COMMAND_NAMES[snake] if use_camel else snake
+
+    return (
+        "Code intelligence tool powered by Pyright Language Server. Provides semantic, "
+        "AST-based understanding of Python code — far more accurate than grep for "
+        "navigating and understanding code structure.\n"
+        "\n"
+        "### Commands\n"
+        "\n"
+        "| Command | What it does | Required args |\n"
+        "|---|---|---|\n"
+        f"{table}\n"
+        "\n"
+        "### Tips\n"
+        f"- Use `{_cmd('get_document_symbols')}` to understand a file's structure before reading it\n"
+        f"- Use `{_cmd('get_workspace_symbols')}` to find where something is defined across the project\n"
+        f"- Use `{_cmd('get_definition')}` to jump to and read the actual source code of any symbol\n"
+        f"- Use `{_cmd('find_references')}` to understand how widely a function or class is used\n"
+        f"- Use `{_cmd('get_call_hierarchy')}` for a quick combined view of callers + callees\n"
+        f"- For fine-grained control, use `{_cmd('prepare_call_hierarchy')}` then `{_cmd('incoming_calls')}`/`{_cmd('outgoing_calls')}`\n"
+        "- `line` is 1-indexed (matches what you see in file editors)\n"
+        "- `symbol` is just the identifier name (e.g., `MyClass`, `my_function`, `my_var`)\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -239,8 +259,9 @@ class LSPTool(ToolDefinition[LSPAction, LSPObservation]):
         lsp_naming: str | None = None,
     ) -> Sequence["LSPTool"]:
         # Allow explicit naming override via Tool(params={"lsp_naming": "camelCase"})
-        if lsp_naming is not None:
-            os.environ["LSP_NAMING"] = lsp_naming
+        if lsp_naming is None:
+            lsp_naming = os.environ.get("LSP_NAMING", "camelCase")
+        os.environ["LSP_NAMING"] = lsp_naming
 
         if terminal_executor is None:
             from openhands.tools.terminal.impl import TerminalExecutor
@@ -253,7 +274,7 @@ class LSPTool(ToolDefinition[LSPAction, LSPObservation]):
 
         return [
             cls(
-                description=LSP_TOOL_DESCRIPTION,
+                description=_build_tool_description(lsp_naming),
                 action_type=LSPAction,
                 observation_type=LSPObservation,
                 executor=executor,
