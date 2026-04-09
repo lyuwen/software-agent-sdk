@@ -250,6 +250,10 @@ class Agent(AgentBase):
                     responses_reasoning_item=message.responses_reasoning_item
                     if i == 0
                     else None,
+                    # Only first gets provider-specific fields
+                    provider_specific_fields=message.provider_specific_fields
+                    if i == 0
+                    else None,
                 )
                 if action_event is None:
                     continue
@@ -396,6 +400,7 @@ class Agent(AgentBase):
         reasoning_content: str | None = None,
         thinking_blocks: list[ThinkingBlock | RedactedThinkingBlock] | None = None,
         responses_reasoning_item: ReasoningItemModel | None = None,
+        provider_specific_fields: dict | None = None,
     ) -> ActionEvent | None:
         """Converts a tool call into an ActionEvent, validating arguments.
 
@@ -415,6 +420,7 @@ class Agent(AgentBase):
                 reasoning_content=reasoning_content,
                 thinking_blocks=thinking_blocks or [],
                 responses_reasoning_item=responses_reasoning_item,
+                provider_specific_fields=provider_specific_fields,
                 tool_call=tool_call,
                 tool_name=tool_call.name,
                 tool_call_id=tool_call.id,
@@ -462,6 +468,7 @@ class Agent(AgentBase):
                 reasoning_content=reasoning_content,
                 thinking_blocks=thinking_blocks or [],
                 responses_reasoning_item=responses_reasoning_item,
+                provider_specific_fields=provider_specific_fields,
                 tool_call=tool_call,
                 tool_name=tool_call.name,
                 tool_call_id=tool_call.id,
@@ -483,6 +490,7 @@ class Agent(AgentBase):
             reasoning_content=reasoning_content,
             thinking_blocks=thinking_blocks or [],
             responses_reasoning_item=responses_reasoning_item,
+            provider_specific_fields=provider_specific_fields,
             tool_name=tool.name,
             tool_call_id=tool_call.id,
             tool_call=tool_call,
