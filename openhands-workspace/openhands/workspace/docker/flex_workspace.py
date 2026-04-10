@@ -148,6 +148,9 @@ class FlexWorkspace(DockerWorkspace):
             ]
         flags += ports
 
+        # Set working directory to / so the agent server uses absolute paths
+        flags += ["-w", "/"]
+
         # Add GPU support if enabled
         if self.enable_gpu:
             flags += ["--gpus", "all"]
