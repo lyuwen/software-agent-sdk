@@ -2,13 +2,14 @@
 
 from typing import TYPE_CHECKING
 
+from .flex_workspace import FlexWorkspace
 from .workspace import DockerWorkspace
 
 
 if TYPE_CHECKING:
     from .dev_workspace import DockerDevWorkspace
 
-__all__ = ["DockerWorkspace", "DockerDevWorkspace"]
+__all__ = ["DockerWorkspace", "DockerDevWorkspace", "FlexWorkspace"]
 
 
 def __getattr__(name: str):

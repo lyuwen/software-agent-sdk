@@ -6,7 +6,7 @@ from openhands.sdk.workspace import PlatformType, TargetType
 
 from .apptainer import ApptainerWorkspace
 from .cloud import OpenHandsCloudWorkspace
-from .docker import DockerWorkspace
+from .docker import DockerWorkspace, FlexWorkspace
 from .remote_api import APIRemoteWorkspace
 
 
@@ -18,6 +18,7 @@ __all__ = [
     "ApptainerWorkspace",
     "DockerDevWorkspace",
     "DockerWorkspace",
+    "FlexWorkspace",
     "OpenHandsCloudWorkspace",
     "PlatformType",
     "TargetType",
