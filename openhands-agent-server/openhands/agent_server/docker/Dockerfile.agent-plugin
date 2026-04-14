@@ -1,0 +1,206 @@
+# syntax=docker/dockerfile:1.7
+#
+# Dockerfile.agent-plugin — builds the portable agent-plugin image.
+#
+# The agent-plugin consolidates everything under /agent-server/ so a single
+# volume mount provides the complete plugin to ANY Debian/Ubuntu-based
+# environment image. No per-image layers, no duplication.
+#
+#   /agent-server/
+#     ├── .venv/              Python venv (agent server)
+#     ├── uv-managed-python/  Managed Python runtime
+#     ├── bin/                uv, uvx, rg, curl, wget, jq, gcc, ...
+#     ├── lib/                Shared libraries for the above binaries
+#     └── openhands-*/        Source packages
+#
+# Build (from repo root):
+#   docker build -f openhands-agent-server/openhands/agent_server/docker/Dockerfile.agent-plugin \
+#     -t openhands/agent-plugin .
+#
+# With options:
+#   docker build -f openhands-agent-server/openhands/agent_server/docker/Dockerfile.agent-plugin \
+#     --build-arg INSTALL_RIPGREP=true \
+#     --build-arg INSTALL_BUILD_TOOLS=true \
+#     -t openhands/agent-plugin .
+#
+# Runtime (data container pattern):
+#   docker create --name=agent-plugin openhands/agent-plugin true
+#   docker run --volumes-from=agent-plugin \
+#     -e PATH="/agent-server/bin:/agent-server/.venv/bin:$PATH" \
+#     -e UV_PYTHON_INSTALL_DIR=/agent-server/uv-managed-python \
+#     -e LD_LIBRARY_PATH="/agent-server/lib" \
+#     my-env-image python -m openhands.agent_server
+
+ARG USERNAME=openhands
+ARG UID=10001
+ARG GID=10001
+
+# Hot-pluggable package toggles
+ARG USE_CN_MIRRORS=false
+ARG INSTALL_AGENT_TOOLS=true
+ARG INSTALL_RIPGREP=false
+ARG INSTALL_BUILD_TOOLS=false
+
+####################################################################################
+# Builder (source mode)
+# Copy source + build a venv.
+####################################################################################
+FROM python:3.12-bullseye AS builder
+ARG USERNAME UID GID
+ENV UV_PROJECT_ENVIRONMENT=/agent-server/.venv
+ENV UV_PYTHON_INSTALL_DIR=/agent-server/uv-managed-python
+
+COPY --from=ghcr.io/astral-sh/uv /uv /uvx /bin/
+
+RUN groupadd -g ${GID} ${USERNAME} \
+ && useradd -m -u ${UID} -g ${GID} -s /usr/sbin/nologin ${USERNAME}
+USER ${USERNAME}
+WORKDIR /agent-server
+# Cache-friendly: lockfiles first
+COPY --chown=${USERNAME}:${USERNAME} pyproject.toml uv.lock README.md LICENSE ./
+COPY --chown=${USERNAME}:${USERNAME} openhands-sdk ./openhands-sdk
+COPY --chown=${USERNAME}:${USERNAME} openhands-tools ./openhands-tools
+COPY --chown=${USERNAME}:${USERNAME} openhands-workspace ./openhands-workspace
+COPY --chown=${USERNAME}:${USERNAME} openhands-agent-server ./openhands-agent-server
+RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
+    uv python install 3.12 && uv venv --python 3.12 .venv && uv sync --frozen --no-editable --managed-python
+
+####################################################################################
+# Binary Builder (binary mode)
+####################################################################################
+FROM builder AS binary-builder
+ARG USERNAME UID GID
+
+RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
+    uv sync --frozen --dev --no-editable
+
+RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
+    uv run pyinstaller openhands-agent-server/openhands/agent_server/agent-server.spec
+RUN test -x /agent-server/dist/openhands-agent-server
+
+####################################################################################
+# Pluggable package stages
+#
+# Each group is built ONCE on Debian, producing a FROM scratch image containing
+# ONLY the delta files (binaries + libs + configs). Disabled = empty scratch = zero
+# overhead thanks to BuildKit lazy evaluation.
+####################################################################################
+
+# Shared base for all package builders (optional CN mirrors)
+FROM debian:bookworm-slim AS pkg-base
+ARG USE_CN_MIRRORS
+RUN if [ "${USE_CN_MIRRORS}" = "true" ]; then \
+        sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
+        sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list 2>/dev/null || true; \
+    fi
+
+# ── Agent tools (curl, wget, jq + Docker/GH CLI prerequisites) ──────────────
+FROM pkg-base AS pkg-agent-tools-builder
+RUN find / -xdev -not -path '/tmp/*' \( -type f -o -type l \) | sort > /tmp/before.txt && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl wget jq apt-transport-https gnupg lsb-release && \
+    rm -rf /var/lib/apt/lists/* && \
+    find / -xdev -not -path '/tmp/*' -not -path '/pkg/*' \( -type f -o -type l \) | sort > /tmp/after.txt && \
+    comm -13 /tmp/before.txt /tmp/after.txt > /tmp/new.txt && \
+    mkdir /pkg && tar cf - -T /tmp/new.txt 2>/dev/null | tar xf - -C /pkg
+
+FROM scratch AS pkg-agent-tools
+COPY --from=pkg-agent-tools-builder /pkg /
+
+# ── Ripgrep ──────────────────────────────────────────────────────────────────
+FROM pkg-base AS pkg-ripgrep-builder
+RUN find / -xdev -not -path '/tmp/*' \( -type f -o -type l \) | sort > /tmp/before.txt && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ripgrep && \
+    rm -rf /var/lib/apt/lists/* && \
+    find / -xdev -not -path '/tmp/*' -not -path '/pkg/*' \( -type f -o -type l \) | sort > /tmp/after.txt && \
+    comm -13 /tmp/before.txt /tmp/after.txt > /tmp/new.txt && \
+    mkdir /pkg && tar cf - -T /tmp/new.txt 2>/dev/null | tar xf - -C /pkg
+
+FROM scratch AS pkg-ripgrep
+COPY --from=pkg-ripgrep-builder /pkg /
+
+# ── Build tools ──────────────────────────────────────────────────────────────
+FROM pkg-base AS pkg-build-tools-builder
+RUN find / -xdev -not -path '/tmp/*' \( -type f -o -type l \) | sort > /tmp/before.txt && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    rm -rf /var/lib/apt/lists/* && \
+    find / -xdev -not -path '/tmp/*' -not -path '/pkg/*' \( -type f -o -type l \) | sort > /tmp/after.txt && \
+    comm -13 /tmp/before.txt /tmp/after.txt > /tmp/new.txt && \
+    mkdir /pkg && tar cf - -T /tmp/new.txt 2>/dev/null | tar xf - -C /pkg
+
+FROM scratch AS pkg-build-tools
+COPY --from=pkg-build-tools-builder /pkg /
+
+# ── Conditional selectors (ARG-driven stage name interpolation) ──────────────
+FROM scratch AS pkg-agent-tools-true
+COPY --from=pkg-agent-tools / /
+FROM scratch AS pkg-agent-tools-false
+
+FROM scratch AS pkg-ripgrep-true
+COPY --from=pkg-ripgrep / /
+FROM scratch AS pkg-ripgrep-false
+
+FROM scratch AS pkg-build-tools-true
+COPY --from=pkg-build-tools / /
+FROM scratch AS pkg-build-tools-false
+
+FROM pkg-agent-tools-${INSTALL_AGENT_TOOLS}  AS selected-agent-tools
+FROM pkg-ripgrep-${INSTALL_RIPGREP}          AS selected-ripgrep
+FROM pkg-build-tools-${INSTALL_BUILD_TOOLS}  AS selected-build-tools
+
+####################################################################################
+# Agent Plugin (portable, mountable)
+#
+# Consolidates everything under /agent-server/ so a single volume mount
+# provides the complete plugin.
+####################################################################################
+FROM busybox AS agent-plugin
+# Core: venv + managed python + source
+COPY --from=builder /agent-server /agent-server
+# Binaries: uv, uvx
+COPY --from=ghcr.io/astral-sh/uv /uv  /agent-server/bin/uv
+COPY --from=ghcr.io/astral-sh/uv /uvx /agent-server/bin/uvx
+# Pluggable packages: copy binaries → /agent-server/bin/, libs → /agent-server/lib/
+COPY --from=selected-agent-tools / /agent-server/tools-staging/
+COPY --from=selected-ripgrep     / /agent-server/tools-staging/
+COPY --from=selected-build-tools / /agent-server/tools-staging/
+# Flatten: move binaries and libs from system paths into /agent-server/{bin,lib}
+RUN mkdir -p /agent-server/bin /agent-server/lib && \
+    for d in usr/bin usr/sbin bin sbin; do \
+        [ -d "/agent-server/tools-staging/$d" ] && \
+        cp -a /agent-server/tools-staging/$d/* /agent-server/bin/ 2>/dev/null; \
+    done; \
+    for d in usr/lib lib; do \
+        [ -d "/agent-server/tools-staging/$d" ] && \
+        cp -a /agent-server/tools-staging/$d/* /agent-server/lib/ 2>/dev/null; \
+    done; \
+    rm -rf /agent-server/tools-staging
+VOLUME /agent-server
+
+# Backward-compatible alias
+FROM agent-plugin AS agent-tools
+
+####################################################################################
+# Binary-only plugin variant (smaller, no source/venv)
+####################################################################################
+FROM busybox AS agent-plugin-binary
+COPY --from=binary-builder /agent-server/dist/openhands-agent-server /agent-server/bin/openhands-agent-server
+COPY --from=ghcr.io/astral-sh/uv /uv  /agent-server/bin/uv
+COPY --from=ghcr.io/astral-sh/uv /uvx /agent-server/bin/uvx
+COPY --from=selected-agent-tools / /agent-server/tools-staging/
+COPY --from=selected-ripgrep     / /agent-server/tools-staging/
+COPY --from=selected-build-tools / /agent-server/tools-staging/
+RUN mkdir -p /agent-server/bin /agent-server/lib && \
+    for d in usr/bin usr/sbin bin sbin; do \
+        [ -d "/agent-server/tools-staging/$d" ] && \
+        cp -a /agent-server/tools-staging/$d/* /agent-server/bin/ 2>/dev/null; \
+    done; \
+    for d in usr/lib lib; do \
+        [ -d "/agent-server/tools-staging/$d" ] && \
+        cp -a /agent-server/tools-staging/$d/* /agent-server/lib/ 2>/dev/null; \
+    done; \
+    rm -rf /agent-server/tools-staging
+VOLUME /agent-server
