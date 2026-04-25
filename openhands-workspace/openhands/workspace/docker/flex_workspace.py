@@ -114,7 +114,7 @@ class FlexWorkspace(DockerWorkspace):
         # Agent-server environment variables
         flags += [
             "-e",
-            "PATH=/agent-server/bin:/agent-server/.venv/bin:"
+            "PATH=/agent-server/bin:"
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "-e",
             "LD_LIBRARY_PATH=/agent-server/lib",

@@ -113,8 +113,12 @@ class DockerWorkspace(RemoteWorkspace):
         description="Whether to delete the Docker image when cleaning up workspace.",
     )
     bind_volumes: list[str] = Field(
-        defaultfactory=list,
+        default_factory=list,
         description="Bind extra directories to container workspace.",
+    )
+    memory_limit: str = Field(
+        default_factory=lambda: os.getenv("OH_WORKSPACE_MEMORY_LIMIT", "13g"),
+        description="Docker container memory limit.",
     )
 
     _container_id: str | None = PrivateAttr(default=None)
@@ -206,6 +210,9 @@ class DockerWorkspace(RemoteWorkspace):
         if self.bind_volumes:
             for volume in self.bind_volumes:
                 flags += ["-v", volume]
+
+        if self.memory_limit:
+            flags += ["--memory", self.memory_limit]
 
         ports = ["-p", f"{self.host_port}:8000"]
         if self.extra_ports:

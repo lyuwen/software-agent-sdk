@@ -22,7 +22,9 @@ def mock_docker_workspace():
             # Create workspace without triggering initialization
             with patch.object(DockerWorkspace, "_start_container"):
                 workspace = DockerWorkspace(
-                    server_image="test:latest", cleanup_image=cleanup_image
+                    server_image="test:latest",
+                    cleanup_image=cleanup_image,
+                    bind_volumes=[],
                 )
 
             # Manually set up state that would normally be set during startup
@@ -78,8 +80,14 @@ def test_docker_workspace_no_build_import():
     env = os.environ.copy()
     root = Path(__file__).resolve().parents[2]
     pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        str(root) if not pythonpath else f"{root}{os.pathsep}{pythonpath}"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(root / "openhands-sdk"),
+            str(root / "openhands-tools"),
+            str(root / "openhands-workspace"),
+            str(root / "openhands-agent-server"),
+            *([pythonpath] if pythonpath else []),
+        ]
     )
 
     result = subprocess.run(
@@ -106,6 +114,108 @@ def test_docker_dev_workspace_has_build_fields():
     assert "server_image" in DockerDevWorkspace.model_fields
     assert "base_image" in DockerDevWorkspace.model_fields
     assert "target" in DockerDevWorkspace.model_fields
+
+
+def test_docker_workspace_uses_default_memory_limit_when_env_is_unset():
+    """DockerWorkspace should default to 13g when no override is configured."""
+    from openhands.workspace import DockerWorkspace
+
+    with patch.dict(os.environ, {}, clear=True):
+        with patch.object(DockerWorkspace, "_start_container"):
+            workspace = DockerWorkspace(server_image="test:latest", bind_volumes=[])
+
+    assert workspace.memory_limit == "13g"
+
+
+def test_docker_workspace_reads_memory_limit_from_environment():
+    """DockerWorkspace should read memory limit from OH_WORKSPACE_MEMORY_LIMIT."""
+    from openhands.workspace import DockerWorkspace
+
+    with patch.dict(os.environ, {"OH_WORKSPACE_MEMORY_LIMIT": "20g"}, clear=True):
+        with patch.object(DockerWorkspace, "_start_container"):
+            workspace = DockerWorkspace(server_image="test:latest", bind_volumes=[])
+
+    assert workspace.memory_limit == "20g"
+
+
+def test_docker_workspace_passes_memory_limit_to_docker_run():
+    """DockerWorkspace should pass configured memory limit to docker run."""
+    from openhands.workspace import DockerWorkspace
+
+    execute_results = [
+        Mock(returncode=0, stdout="", stderr=""),
+        Mock(returncode=0, stdout="container-123\n", stderr=""),
+        Mock(returncode=0, stdout="", stderr=""),
+    ]
+
+    with patch("openhands.workspace.docker.workspace.find_available_tcp_port", return_value=34567):
+        with patch("openhands.workspace.docker.workspace.check_port_available", return_value=True):
+            with patch("openhands.workspace.docker.workspace.execute_command", side_effect=execute_results) as mock_exec:
+                with patch.object(DockerWorkspace, "_wait_for_health"):
+                    with patch("openhands.sdk.workspace.remote.RemoteWorkspace.model_post_init"):
+                        DockerWorkspace(
+                            server_image="test:latest",
+                            memory_limit="17g",
+                            detach_logs=False,
+                            bind_volumes=[],
+                        )
+
+    run_cmd = mock_exec.call_args_list[1].args[0]
+    assert "--memory" in run_cmd
+    assert "17g" in run_cmd
+
+
+def test_flex_workspace_path_excludes_agent_server_venv_bin():
+    """FlexWorkspace should not expose the agent server venv on PATH."""
+    from openhands.workspace import FlexWorkspace
+
+    execute_results = [
+        Mock(returncode=0, stdout="", stderr=""),
+        Mock(returncode=0, stdout="plugin-container\n", stderr=""),
+        Mock(returncode=0, stdout="workspace-container\n", stderr=""),
+    ]
+
+    with patch("openhands.workspace.docker.flex_workspace.find_available_tcp_port", return_value=34567):
+        with patch("openhands.workspace.docker.flex_workspace.check_port_available", return_value=True):
+            with patch("openhands.workspace.docker.flex_workspace.execute_command", side_effect=execute_results) as mock_exec:
+                with patch.object(FlexWorkspace, "_wait_for_health"):
+                    with patch("openhands.sdk.workspace.remote.RemoteWorkspace.model_post_init"):
+                        FlexWorkspace(
+                            base_image="base:latest",
+                            detach_logs=False,
+                            bind_volumes=[],
+                        )
+
+    run_cmd = mock_exec.call_args_list[2].args[0]
+    path_arg = next(arg for arg in run_cmd if arg.startswith("PATH="))
+    assert "/agent-server/.venv/bin" not in path_arg
+    assert "/agent-server/bin" in path_arg
+
+
+def test_flex_workspace_still_uses_agent_server_venv_python_entrypoint():
+    """FlexWorkspace should keep launching the server with its venv python."""
+    from openhands.workspace import FlexWorkspace
+
+    execute_results = [
+        Mock(returncode=0, stdout="", stderr=""),
+        Mock(returncode=0, stdout="plugin-container\n", stderr=""),
+        Mock(returncode=0, stdout="workspace-container\n", stderr=""),
+    ]
+
+    with patch("openhands.workspace.docker.flex_workspace.find_available_tcp_port", return_value=34567):
+        with patch("openhands.workspace.docker.flex_workspace.check_port_available", return_value=True):
+            with patch("openhands.workspace.docker.flex_workspace.execute_command", side_effect=execute_results) as mock_exec:
+                with patch.object(FlexWorkspace, "_wait_for_health"):
+                    with patch("openhands.sdk.workspace.remote.RemoteWorkspace.model_post_init"):
+                        FlexWorkspace(
+                            base_image="base:latest",
+                            detach_logs=False,
+                            bind_volumes=[],
+                        )
+
+    run_cmd = mock_exec.call_args_list[2].args[0]
+    entrypoint_index = run_cmd.index("--entrypoint")
+    assert run_cmd[entrypoint_index + 1] == "/agent-server/.venv/bin/python"
 
 
 def test_cleanup_without_image_deletion(mock_docker_workspace):
