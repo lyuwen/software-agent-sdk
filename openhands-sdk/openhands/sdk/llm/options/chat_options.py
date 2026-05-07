@@ -95,4 +95,9 @@ def select_chat_options(
     if llm.litellm_extra_body:
         out["extra_body"] = llm.litellm_extra_body
 
+    # Pass through user-provided litellm params unchanged
+    # This parameter has the highest priority, proceed with caution
+    if llm.litellm_params:
+        out.update(llm.litellm_params)
+
     return out

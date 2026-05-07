@@ -314,6 +314,13 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             "- vLLM features: {'return_token_ids': True}"
         ),
     )
+    litellm_params: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Additional key-value pairs to pass to litellm's inference function. "
+            "This overrides everything."
+        ),
+    )
 
     # =========================================================================
     # Internal fields (excluded from dumps)
