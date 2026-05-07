@@ -200,6 +200,11 @@ class DockerWorkspace(RemoteWorkspace):
             if key in os.environ:
                 flags += ["-e", f"{key}={os.environ[key]}"]
 
+        # Forward environment variables with OH_ prefix
+        for key, val in os.environ.items():
+            if key.startswith("OH_") and key not in self.forward_env:
+                flags += ["-e", f"{key}={val}"]
+
         if self.mount_dir:
             mount_path = "/workspace"
             flags += ["-v", f"{self.mount_dir}:{mount_path}"]
@@ -227,6 +232,9 @@ class DockerWorkspace(RemoteWorkspace):
         # Add GPU support if enabled
         if self.enable_gpu:
             flags += ["--gpus", "all"]
+
+        # Set memory limit per instance
+        flags += ["--memory=14g"]
 
         # Run container
         run_cmd = [
