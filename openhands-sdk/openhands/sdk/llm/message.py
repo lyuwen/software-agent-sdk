@@ -248,6 +248,11 @@ class Message(BaseModel):
         default=None,
         description="OpenAI Responses reasoning item from model output",
     )
+    # Provider-specific fields (e.g., Anthropic interleaved thinking metadata)
+    provider_specific_fields: dict | None = Field(
+        default=None,
+        description="Provider-specific fields from LiteLLM response, passed through opaquely",
+    )
 
     @property
     def contains_image(self) -> bool:
@@ -296,6 +301,10 @@ class Message(BaseModel):
         # Required for model like kimi-k2-thinking
         if self.send_reasoning_content and self.reasoning_content:
             message_dict["reasoning_content"] = self.reasoning_content
+
+        # Pass through provider-specific fields (e.g., Anthropic interleaved thinking)
+        if self.provider_specific_fields:
+            message_dict["provider_specific_fields"] = self.provider_specific_fields
 
         return message_dict
 
@@ -536,6 +545,7 @@ class Message(BaseModel):
 
         rc = getattr(message, "reasoning_content", None)
         thinking_blocks = getattr(message, "thinking_blocks", None)
+        provider_specific_fields = getattr(message, "provider_specific_fields", None)
 
         # Convert to list of ThinkingBlock or RedactedThinkingBlock
         if thinking_blocks is not None:
@@ -581,6 +591,7 @@ class Message(BaseModel):
             tool_calls=tool_calls,
             reasoning_content=rc,
             thinking_blocks=thinking_blocks,
+            provider_specific_fields=provider_specific_fields,
         )
 
     @classmethod
