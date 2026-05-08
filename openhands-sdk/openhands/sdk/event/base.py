@@ -146,4 +146,5 @@ def _combine_action_events(events: list["ActionEvent"]) -> Message:
         tool_calls=[event.tool_call for event in events],
         reasoning_content=events[0].reasoning_content,  # Shared reasoning content
         thinking_blocks=events[0].thinking_blocks,  # Shared thinking blocks
+        provider_specific_fields=events[0].provider_specific_fields,  # Shared provider fields
     )

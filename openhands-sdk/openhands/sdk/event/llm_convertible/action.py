@@ -33,6 +33,10 @@ class ActionEvent(LLMConvertibleEvent):
     responses_reasoning_item: ReasoningItemModel | None = Field(
         default=None, description="OpenAI Responses reasoning item from model output"
     )
+    provider_specific_fields: dict | None = Field(
+        default=None,
+        description="Provider-specific fields from LiteLLM response, passed through opaquely",
+    )
     action: Action | None = Field(
         default=None,
         description="Single tool call returned by LLM (None when non-executable)",
@@ -136,6 +140,7 @@ class ActionEvent(LLMConvertibleEvent):
             reasoning_content=self.reasoning_content,
             thinking_blocks=self.thinking_blocks,
             responses_reasoning_item=self.responses_reasoning_item,
+            provider_specific_fields=self.provider_specific_fields,
         )
 
     def __str__(self) -> str:
