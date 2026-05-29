@@ -372,6 +372,9 @@ FROM agent-plugin AS agent-tools
 
 ####################################################################################
 # Binary-only plugin variant (smaller, no source/venv)
+# NOTE: This target only includes bookworm (default) tools — no multi-glibc
+# variant directories. If you need buster/bullseye support, use the
+# agent-plugin target instead.
 ####################################################################################
 FROM busybox AS agent-plugin-binary
 COPY --from=binary-builder /agent-server/dist/openhands-agent-server /agent-server/bin/openhands-agent-server

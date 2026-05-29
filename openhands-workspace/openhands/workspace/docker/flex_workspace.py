@@ -31,9 +31,21 @@ _DEFAULT_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
 def _detect_glibc_version(image: str, platform: str = "linux/amd64") -> float | None:
     """Detect the glibc version inside a Docker image.
 
-    Runs ``ldd --version`` in a throwaway container and parses the output.
-    Returns the glibc major.minor as a float (e.g. 2.31), or None on failure.
+    Pulls the image first (if not local), then runs ``ldd --version`` in a
+    throwaway container.  Returns the glibc major.minor as a float (e.g. 2.31),
+    or None on failure.
     """
+    # Pull separately so the detection command itself doesn't time out
+    pull_proc = execute_command(
+        ["docker", "pull", "--platform", platform, image],
+        timeout=600,
+    )
+    if pull_proc.returncode != 0:
+        logger.warning(
+            "docker pull failed for %s (exit %d): %s",
+            image, pull_proc.returncode, pull_proc.stderr,
+        )
+
     proc = execute_command(
         [
             "docker", "run", "--rm",
@@ -42,7 +54,7 @@ def _detect_glibc_version(image: str, platform: str = "linux/amd64") -> float | 
             image,
             "ldd", "--version",
         ],
-        timeout=120,
+        timeout=30,
     )
     if proc.returncode != 0:
         logger.warning(
