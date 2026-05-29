@@ -9,8 +9,12 @@
 #   /agent-server/
 #     ├── .venv/              Python venv (agent server)
 #     ├── uv-managed-python/  Managed Python runtime
-#     ├── bin/                uv, uvx, rg, curl, wget, jq, gcc, ...
-#     ├── lib/                Shared libraries for the above binaries
+#     ├── bin/                Default binaries (bookworm) — backward compat
+#     ├── lib/                Default shared libs (bookworm) — backward compat
+#     ├── variants/
+#     │   ├── buster/{bin,lib}    glibc 2.28 (Debian 10)
+#     │   ├── bullseye/{bin,lib}  glibc 2.31 (Debian 11, Ubuntu 20.04)
+#     │   └── bookworm/{bin,lib}  glibc 2.36 (Debian 12, Ubuntu 22.04+)
 #     └── openhands-*/        Source packages
 #
 # Build (from repo root):
@@ -30,6 +34,9 @@
 #     -e UV_PYTHON_INSTALL_DIR=/agent-server/uv-managed-python \
 #     -e LD_LIBRARY_PATH="/agent-server/lib" \
 #     my-env-image python -m openhands.agent_server
+#
+# For older glibc targets, FlexWorkspace detects the glibc version and uses
+# the matching variant directory instead of the default bin/lib.
 
 ARG USERNAME=openhands
 ARG UID=10001
@@ -79,23 +86,52 @@ RUN --mount=type=cache,target=/home/${USERNAME}/.cache,uid=${UID},gid=${GID} \
 RUN test -x /agent-server/dist/openhands-agent-server
 
 ####################################################################################
-# Pluggable package stages
+# Pluggable package stages — multi-glibc
 #
-# Each group is built ONCE on Debian, producing a FROM scratch image containing
-# ONLY the delta files (binaries + libs + configs). Disabled = empty scratch = zero
-# overhead thanks to BuildKit lazy evaluation.
+# Each group is built per Debian release, producing a FROM scratch image
+# containing ONLY the delta files (binaries + libs). Disabled = empty scratch
+# = zero overhead thanks to BuildKit lazy evaluation.
+#
+# Supported variants: buster (glibc 2.28), bullseye (glibc 2.31),
+#                     bookworm (glibc 2.36)
 ####################################################################################
 
-# Shared base for all package builders (optional CN mirrors)
-FROM debian:bookworm-slim AS pkg-base
+# ── Buster pkg-base ────────────────────────────────────────────────────────────
+FROM debian:buster-slim AS pkg-base-buster
+ARG USE_CN_MIRRORS
+RUN if [ "${USE_CN_MIRRORS}" = "true" ]; then \
+        sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list 2>/dev/null || true; \
+    fi && \
+    sed -i 's|deb.debian.org|archive.debian.org|g' /etc/apt/sources.list 2>/dev/null || true && \
+    sed -i '/security.debian.org/d' /etc/apt/sources.list 2>/dev/null || true && \
+    sed -i '/updates/d' /etc/apt/sources.list 2>/dev/null || true && \
+    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
+
+# ── Bullseye pkg-base ──────────────────────────────────────────────────────────
+FROM debian:bullseye-slim AS pkg-base-bullseye
+ARG USE_CN_MIRRORS
+RUN if [ "${USE_CN_MIRRORS}" = "true" ]; then \
+        sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list 2>/dev/null || true; \
+    fi
+
+# ── Bookworm pkg-base (default) ───────────────────────────────────────────────
+FROM debian:bookworm-slim AS pkg-base-bookworm
 ARG USE_CN_MIRRORS
 RUN if [ "${USE_CN_MIRRORS}" = "true" ]; then \
         sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
         sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list 2>/dev/null || true; \
     fi
 
-# ── Agent tools (curl, wget, jq + Docker/GH CLI prerequisites) ──────────────
-FROM pkg-base AS pkg-agent-tools-builder
+# Backward-compatible alias
+FROM pkg-base-bookworm AS pkg-base
+
+####################################################################################
+# Macro: build one package group on a given Debian base.
+# We repeat the pattern for each (distro, package-group) combination.
+####################################################################################
+
+# ── Agent tools per distro ─────────────────────────────────────────────────────
+FROM pkg-base-buster AS pkg-agent-tools-builder-buster
 RUN find / -xdev -not -path '/tmp/*' \( -type f -o -type l \) | sort > /tmp/before.txt && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -104,12 +140,62 @@ RUN find / -xdev -not -path '/tmp/*' \( -type f -o -type l \) | sort > /tmp/befo
     find / -xdev -not -path '/tmp/*' -not -path '/pkg/*' \( -type f -o -type l \) | sort > /tmp/after.txt && \
     comm -13 /tmp/before.txt /tmp/after.txt > /tmp/new.txt && \
     mkdir /pkg && tar cf - -T /tmp/new.txt 2>/dev/null | tar xf - -C /pkg
+FROM scratch AS pkg-agent-tools-buster
+COPY --from=pkg-agent-tools-builder-buster /pkg /
 
+FROM pkg-base-bullseye AS pkg-agent-tools-builder-bullseye
+RUN find / -xdev -not -path '/tmp/*' \( -type f -o -type l \) | sort > /tmp/before.txt && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl wget jq apt-transport-https gnupg lsb-release && \
+    rm -rf /var/lib/apt/lists/* && \
+    find / -xdev -not -path '/tmp/*' -not -path '/pkg/*' \( -type f -o -type l \) | sort > /tmp/after.txt && \
+    comm -13 /tmp/before.txt /tmp/after.txt > /tmp/new.txt && \
+    mkdir /pkg && tar cf - -T /tmp/new.txt 2>/dev/null | tar xf - -C /pkg
+FROM scratch AS pkg-agent-tools-bullseye
+COPY --from=pkg-agent-tools-builder-bullseye /pkg /
+
+FROM pkg-base-bookworm AS pkg-agent-tools-builder-bookworm
+RUN find / -xdev -not -path '/tmp/*' \( -type f -o -type l \) | sort > /tmp/before.txt && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl wget jq apt-transport-https gnupg lsb-release && \
+    rm -rf /var/lib/apt/lists/* && \
+    find / -xdev -not -path '/tmp/*' -not -path '/pkg/*' \( -type f -o -type l \) | sort > /tmp/after.txt && \
+    comm -13 /tmp/before.txt /tmp/after.txt > /tmp/new.txt && \
+    mkdir /pkg && tar cf - -T /tmp/new.txt 2>/dev/null | tar xf - -C /pkg
+FROM scratch AS pkg-agent-tools-bookworm
+COPY --from=pkg-agent-tools-builder-bookworm /pkg /
+
+# Default alias (bookworm)
 FROM scratch AS pkg-agent-tools
-COPY --from=pkg-agent-tools-builder /pkg /
+COPY --from=pkg-agent-tools-bookworm / /
 
-# ── Ripgrep ──────────────────────────────────────────────────────────────────
-FROM pkg-base AS pkg-ripgrep-builder
+# ── Ripgrep per distro ─────────────────────────────────────────────────────────
+# Note: ripgrep may not be in older repos; install errors are tolerated.
+FROM pkg-base-buster AS pkg-ripgrep-builder-buster
+RUN find / -xdev -not -path '/tmp/*' \( -type f -o -type l \) | sort > /tmp/before.txt && \
+    apt-get update && \
+    (apt-get install -y --no-install-recommends ripgrep || true) && \
+    rm -rf /var/lib/apt/lists/* && \
+    find / -xdev -not -path '/tmp/*' -not -path '/pkg/*' \( -type f -o -type l \) | sort > /tmp/after.txt && \
+    comm -13 /tmp/before.txt /tmp/after.txt > /tmp/new.txt && \
+    mkdir /pkg && tar cf - -T /tmp/new.txt 2>/dev/null | tar xf - -C /pkg
+FROM scratch AS pkg-ripgrep-buster
+COPY --from=pkg-ripgrep-builder-buster /pkg /
+
+FROM pkg-base-bullseye AS pkg-ripgrep-builder-bullseye
+RUN find / -xdev -not -path '/tmp/*' \( -type f -o -type l \) | sort > /tmp/before.txt && \
+    apt-get update && \
+    (apt-get install -y --no-install-recommends ripgrep || true) && \
+    rm -rf /var/lib/apt/lists/* && \
+    find / -xdev -not -path '/tmp/*' -not -path '/pkg/*' \( -type f -o -type l \) | sort > /tmp/after.txt && \
+    comm -13 /tmp/before.txt /tmp/after.txt > /tmp/new.txt && \
+    mkdir /pkg && tar cf - -T /tmp/new.txt 2>/dev/null | tar xf - -C /pkg
+FROM scratch AS pkg-ripgrep-bullseye
+COPY --from=pkg-ripgrep-builder-bullseye /pkg /
+
+FROM pkg-base-bookworm AS pkg-ripgrep-builder-bookworm
 RUN find / -xdev -not -path '/tmp/*' \( -type f -o -type l \) | sort > /tmp/before.txt && \
     apt-get update && \
     apt-get install -y --no-install-recommends ripgrep && \
@@ -117,12 +203,14 @@ RUN find / -xdev -not -path '/tmp/*' \( -type f -o -type l \) | sort > /tmp/befo
     find / -xdev -not -path '/tmp/*' -not -path '/pkg/*' \( -type f -o -type l \) | sort > /tmp/after.txt && \
     comm -13 /tmp/before.txt /tmp/after.txt > /tmp/new.txt && \
     mkdir /pkg && tar cf - -T /tmp/new.txt 2>/dev/null | tar xf - -C /pkg
+FROM scratch AS pkg-ripgrep-bookworm
+COPY --from=pkg-ripgrep-builder-bookworm /pkg /
 
 FROM scratch AS pkg-ripgrep
-COPY --from=pkg-ripgrep-builder /pkg /
+COPY --from=pkg-ripgrep-bookworm / /
 
-# ── Build tools ──────────────────────────────────────────────────────────────
-FROM pkg-base AS pkg-build-tools-builder
+# ── Build tools per distro ─────────────────────────────────────────────────────
+FROM pkg-base-buster AS pkg-build-tools-builder-buster
 RUN find / -xdev -not -path '/tmp/*' \( -type f -o -type l \) | sort > /tmp/before.txt && \
     apt-get update && \
     apt-get install -y --no-install-recommends build-essential && \
@@ -130,11 +218,35 @@ RUN find / -xdev -not -path '/tmp/*' \( -type f -o -type l \) | sort > /tmp/befo
     find / -xdev -not -path '/tmp/*' -not -path '/pkg/*' \( -type f -o -type l \) | sort > /tmp/after.txt && \
     comm -13 /tmp/before.txt /tmp/after.txt > /tmp/new.txt && \
     mkdir /pkg && tar cf - -T /tmp/new.txt 2>/dev/null | tar xf - -C /pkg
+FROM scratch AS pkg-build-tools-buster
+COPY --from=pkg-build-tools-builder-buster /pkg /
+
+FROM pkg-base-bullseye AS pkg-build-tools-builder-bullseye
+RUN find / -xdev -not -path '/tmp/*' \( -type f -o -type l \) | sort > /tmp/before.txt && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    rm -rf /var/lib/apt/lists/* && \
+    find / -xdev -not -path '/tmp/*' -not -path '/pkg/*' \( -type f -o -type l \) | sort > /tmp/after.txt && \
+    comm -13 /tmp/before.txt /tmp/after.txt > /tmp/new.txt && \
+    mkdir /pkg && tar cf - -T /tmp/new.txt 2>/dev/null | tar xf - -C /pkg
+FROM scratch AS pkg-build-tools-bullseye
+COPY --from=pkg-build-tools-builder-bullseye /pkg /
+
+FROM pkg-base-bookworm AS pkg-build-tools-builder-bookworm
+RUN find / -xdev -not -path '/tmp/*' \( -type f -o -type l \) | sort > /tmp/before.txt && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    rm -rf /var/lib/apt/lists/* && \
+    find / -xdev -not -path '/tmp/*' -not -path '/pkg/*' \( -type f -o -type l \) | sort > /tmp/after.txt && \
+    comm -13 /tmp/before.txt /tmp/after.txt > /tmp/new.txt && \
+    mkdir /pkg && tar cf - -T /tmp/new.txt 2>/dev/null | tar xf - -C /pkg
+FROM scratch AS pkg-build-tools-bookworm
+COPY --from=pkg-build-tools-builder-bookworm /pkg /
 
 FROM scratch AS pkg-build-tools
-COPY --from=pkg-build-tools-builder /pkg /
+COPY --from=pkg-build-tools-bookworm / /
 
-# ── Conditional selectors (ARG-driven stage name interpolation) ──────────────
+# ── Conditional selectors (ARG-driven stage name interpolation) ────────────────
 FROM scratch AS pkg-agent-tools-true
 COPY --from=pkg-agent-tools / /
 FROM scratch AS pkg-agent-tools-false
@@ -151,23 +263,60 @@ FROM pkg-agent-tools-${INSTALL_AGENT_TOOLS}  AS selected-agent-tools
 FROM pkg-ripgrep-${INSTALL_RIPGREP}          AS selected-ripgrep
 FROM pkg-build-tools-${INSTALL_BUILD_TOOLS}  AS selected-build-tools
 
+# Per-variant conditional selectors
+FROM scratch AS pkg-agent-tools-buster-true
+COPY --from=pkg-agent-tools-buster / /
+FROM scratch AS pkg-agent-tools-buster-false
+
+FROM scratch AS pkg-agent-tools-bullseye-true
+COPY --from=pkg-agent-tools-bullseye / /
+FROM scratch AS pkg-agent-tools-bullseye-false
+
+FROM scratch AS pkg-ripgrep-buster-true
+COPY --from=pkg-ripgrep-buster / /
+FROM scratch AS pkg-ripgrep-buster-false
+
+FROM scratch AS pkg-ripgrep-bullseye-true
+COPY --from=pkg-ripgrep-bullseye / /
+FROM scratch AS pkg-ripgrep-bullseye-false
+
+FROM scratch AS pkg-build-tools-buster-true
+COPY --from=pkg-build-tools-buster / /
+FROM scratch AS pkg-build-tools-buster-false
+
+FROM scratch AS pkg-build-tools-bullseye-true
+COPY --from=pkg-build-tools-bullseye / /
+FROM scratch AS pkg-build-tools-bullseye-false
+
+FROM pkg-agent-tools-buster-${INSTALL_AGENT_TOOLS}    AS selected-agent-tools-buster
+FROM pkg-agent-tools-bullseye-${INSTALL_AGENT_TOOLS}   AS selected-agent-tools-bullseye
+FROM pkg-ripgrep-buster-${INSTALL_RIPGREP}             AS selected-ripgrep-buster
+FROM pkg-ripgrep-bullseye-${INSTALL_RIPGREP}            AS selected-ripgrep-bullseye
+FROM pkg-build-tools-buster-${INSTALL_BUILD_TOOLS}     AS selected-build-tools-buster
+FROM pkg-build-tools-bullseye-${INSTALL_BUILD_TOOLS}    AS selected-build-tools-bullseye
+
+####################################################################################
+# Helper: flatten staged packages into bin/ and lib/
+# Used as a build script inside busybox stages.
+####################################################################################
+
 ####################################################################################
 # Agent Plugin (portable, mountable)
 #
 # Consolidates everything under /agent-server/ so a single volume mount
-# provides the complete plugin.
+# provides the complete plugin.  Includes per-glibc variant directories.
 ####################################################################################
 FROM busybox AS agent-plugin
 # Core: venv + managed python + source
 COPY --from=builder /agent-server /agent-server
-# Binaries: uv, uvx
+# Binaries: uv, uvx (statically linked — glibc-independent)
 COPY --from=ghcr.io/astral-sh/uv /uv  /agent-server/bin/uv
 COPY --from=ghcr.io/astral-sh/uv /uvx /agent-server/bin/uvx
-# Pluggable packages: copy binaries → /agent-server/bin/, libs → /agent-server/lib/
+
+# ── Default variant (bookworm) → /agent-server/{bin,lib} ──────────────────────
 COPY --from=selected-agent-tools / /agent-server/tools-staging/
 COPY --from=selected-ripgrep     / /agent-server/tools-staging/
 COPY --from=selected-build-tools / /agent-server/tools-staging/
-# Flatten: move binaries and libs from system paths into /agent-server/{bin,lib}
 RUN mkdir -p /agent-server/bin /agent-server/lib && \
     for d in usr/bin usr/sbin bin sbin; do \
         [ -d "/agent-server/tools-staging/$d" ] && \
@@ -178,6 +327,41 @@ RUN mkdir -p /agent-server/bin /agent-server/lib && \
         cp -a /agent-server/tools-staging/$d/* /agent-server/lib/ 2>/dev/null; \
     done; \
     rm -rf /agent-server/tools-staging
+
+# ── Buster variant → /agent-server/variants/buster/{bin,lib} ──────────────────
+COPY --from=selected-agent-tools-buster  / /agent-server/tools-staging/
+COPY --from=selected-ripgrep-buster      / /agent-server/tools-staging/
+COPY --from=selected-build-tools-buster  / /agent-server/tools-staging/
+RUN mkdir -p /agent-server/variants/buster/bin /agent-server/variants/buster/lib && \
+    cp -a /agent-server/bin/uv  /agent-server/variants/buster/bin/uv  2>/dev/null; \
+    cp -a /agent-server/bin/uvx /agent-server/variants/buster/bin/uvx 2>/dev/null; \
+    for d in usr/bin usr/sbin bin sbin; do \
+        [ -d "/agent-server/tools-staging/$d" ] && \
+        cp -a /agent-server/tools-staging/$d/* /agent-server/variants/buster/bin/ 2>/dev/null; \
+    done; \
+    for d in usr/lib lib; do \
+        [ -d "/agent-server/tools-staging/$d" ] && \
+        cp -a /agent-server/tools-staging/$d/* /agent-server/variants/buster/lib/ 2>/dev/null; \
+    done; \
+    rm -rf /agent-server/tools-staging
+
+# ── Bullseye variant → /agent-server/variants/bullseye/{bin,lib} ──────────────
+COPY --from=selected-agent-tools-bullseye  / /agent-server/tools-staging/
+COPY --from=selected-ripgrep-bullseye      / /agent-server/tools-staging/
+COPY --from=selected-build-tools-bullseye  / /agent-server/tools-staging/
+RUN mkdir -p /agent-server/variants/bullseye/bin /agent-server/variants/bullseye/lib && \
+    cp -a /agent-server/bin/uv  /agent-server/variants/bullseye/bin/uv  2>/dev/null; \
+    cp -a /agent-server/bin/uvx /agent-server/variants/bullseye/bin/uvx 2>/dev/null; \
+    for d in usr/bin usr/sbin bin sbin; do \
+        [ -d "/agent-server/tools-staging/$d" ] && \
+        cp -a /agent-server/tools-staging/$d/* /agent-server/variants/bullseye/bin/ 2>/dev/null; \
+    done; \
+    for d in usr/lib lib; do \
+        [ -d "/agent-server/tools-staging/$d" ] && \
+        cp -a /agent-server/tools-staging/$d/* /agent-server/variants/bullseye/lib/ 2>/dev/null; \
+    done; \
+    rm -rf /agent-server/tools-staging
+
 VOLUME /agent-server
 
 # Backward-compatible alias
