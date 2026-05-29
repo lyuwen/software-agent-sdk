@@ -42,7 +42,7 @@ def _detect_glibc_version(image: str, platform: str = "linux/amd64") -> float | 
             image,
             "ldd", "--version",
         ],
-        timeout=30,
+        timeout=120,
     )
     if proc.returncode != 0:
         logger.warning(

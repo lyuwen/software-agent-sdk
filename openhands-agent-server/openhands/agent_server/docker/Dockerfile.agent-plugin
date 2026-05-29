@@ -12,9 +12,9 @@
 #     ├── bin/                Default binaries (bookworm) — backward compat
 #     ├── lib/                Default shared libs (bookworm) — backward compat
 #     ├── variants/
-#     │   ├── buster/{bin,lib}    glibc 2.28 (Debian 10)
-#     │   ├── bullseye/{bin,lib}  glibc 2.31 (Debian 11, Ubuntu 20.04)
-#     │   └── bookworm/{bin,lib}  glibc 2.36 (Debian 12, Ubuntu 22.04+)
+#     │   ├── buster/{bin,lib}    glibc 2.28 (Debian 10, Ubuntu 18.04)
+#     │   ├── bullseye/{bin,lib}  glibc 2.31 (Debian 11, Ubuntu 20.04/22.04)
+#     │   └── bookworm/{bin,lib}  glibc 2.36 (Debian 12, Ubuntu 23.04+)
 #     └── openhands-*/        Source packages
 #
 # Build (from repo root):
@@ -322,9 +322,10 @@ RUN mkdir -p /agent-server/bin /agent-server/lib && \
         [ -d "/agent-server/tools-staging/$d" ] && \
         cp -a /agent-server/tools-staging/$d/* /agent-server/bin/ 2>/dev/null; \
     done; \
-    for d in usr/lib lib; do \
+    for d in usr/lib/x86_64-linux-gnu usr/lib lib; do \
         [ -d "/agent-server/tools-staging/$d" ] && \
-        cp -a /agent-server/tools-staging/$d/* /agent-server/lib/ 2>/dev/null; \
+        find /agent-server/tools-staging/$d -maxdepth 1 \( -name '*.so*' -o -name '*.a' \) \
+            -exec cp -a {} /agent-server/lib/ \; 2>/dev/null; \
     done; \
     rm -rf /agent-server/tools-staging
 
@@ -339,9 +340,10 @@ RUN mkdir -p /agent-server/variants/buster/bin /agent-server/variants/buster/lib
         [ -d "/agent-server/tools-staging/$d" ] && \
         cp -a /agent-server/tools-staging/$d/* /agent-server/variants/buster/bin/ 2>/dev/null; \
     done; \
-    for d in usr/lib lib; do \
+    for d in usr/lib/x86_64-linux-gnu usr/lib lib; do \
         [ -d "/agent-server/tools-staging/$d" ] && \
-        cp -a /agent-server/tools-staging/$d/* /agent-server/variants/buster/lib/ 2>/dev/null; \
+        find /agent-server/tools-staging/$d -maxdepth 1 \( -name '*.so*' -o -name '*.a' \) \
+            -exec cp -a {} /agent-server/variants/buster/lib/ \; 2>/dev/null; \
     done; \
     rm -rf /agent-server/tools-staging
 
@@ -356,9 +358,10 @@ RUN mkdir -p /agent-server/variants/bullseye/bin /agent-server/variants/bullseye
         [ -d "/agent-server/tools-staging/$d" ] && \
         cp -a /agent-server/tools-staging/$d/* /agent-server/variants/bullseye/bin/ 2>/dev/null; \
     done; \
-    for d in usr/lib lib; do \
+    for d in usr/lib/x86_64-linux-gnu usr/lib lib; do \
         [ -d "/agent-server/tools-staging/$d" ] && \
-        cp -a /agent-server/tools-staging/$d/* /agent-server/variants/bullseye/lib/ 2>/dev/null; \
+        find /agent-server/tools-staging/$d -maxdepth 1 \( -name '*.so*' -o -name '*.a' \) \
+            -exec cp -a {} /agent-server/variants/bullseye/lib/ \; 2>/dev/null; \
     done; \
     rm -rf /agent-server/tools-staging
 
@@ -382,9 +385,10 @@ RUN mkdir -p /agent-server/bin /agent-server/lib && \
         [ -d "/agent-server/tools-staging/$d" ] && \
         cp -a /agent-server/tools-staging/$d/* /agent-server/bin/ 2>/dev/null; \
     done; \
-    for d in usr/lib lib; do \
+    for d in usr/lib/x86_64-linux-gnu usr/lib lib; do \
         [ -d "/agent-server/tools-staging/$d" ] && \
-        cp -a /agent-server/tools-staging/$d/* /agent-server/lib/ 2>/dev/null; \
+        find /agent-server/tools-staging/$d -maxdepth 1 \( -name '*.so*' -o -name '*.a' \) \
+            -exec cp -a {} /agent-server/lib/ \; 2>/dev/null; \
     done; \
     rm -rf /agent-server/tools-staging
 VOLUME /agent-server
