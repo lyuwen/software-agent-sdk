@@ -182,6 +182,10 @@ class FlexWorkspace(DockerWorkspace):
         if variant:
             bin_path = f"/agent-server/variants/{variant}/bin"
             lib_path = f"/agent-server/variants/{variant}/lib"
+            # Include default paths as fallback for old plugin images that
+            # lack variant directories — non-existent PATH entries are harmless.
+            fallback_bin = "/agent-server/bin"
+            fallback_lib = "/agent-server/lib"
             logger.info(
                 "Using glibc variant '%s' (glibc %.2f) for bin/lib paths",
                 variant, glibc_ver,
@@ -189,10 +193,21 @@ class FlexWorkspace(DockerWorkspace):
         else:
             bin_path = "/agent-server/bin"
             lib_path = "/agent-server/lib"
+            fallback_bin = None
+            fallback_lib = None
 
         # Preserve the base image's PATH — prepend agent-server paths
         base_path = _get_base_image_path(image)
-        combined_path = f"{bin_path}:{base_path}"
+        path_parts = [bin_path]
+        if fallback_bin:
+            path_parts.append(fallback_bin)
+        path_parts.append(base_path)
+        combined_path = ":".join(path_parts)
+
+        lib_parts = [lib_path]
+        if fallback_lib:
+            lib_parts.append(fallback_lib)
+        combined_lib = ":".join(lib_parts)
 
         # Create plugin data container
         self._plugin_container_name = f"agent-plugin-{uuid.uuid4()}"
@@ -221,7 +236,7 @@ class FlexWorkspace(DockerWorkspace):
         # Agent-server environment variables
         flags += [
             "-e", f"PATH={combined_path}",
-            "-e", f"LD_LIBRARY_PATH={lib_path}",
+            "-e", f"LD_LIBRARY_PATH={combined_lib}",
             "-e", "UV_PYTHON_INSTALL_DIR=/agent-server/uv-managed-python",
         ]
 
