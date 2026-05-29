@@ -81,13 +81,13 @@ def _select_variant(glibc_version: float | None) -> str | None:
 
 
 def _get_base_image_path(image: str) -> str:
-    """Read the base image's original PATH via docker inspect.
+    """Read the base image's original PATH via docker image inspect.
 
     Falls back to the standard system PATH if inspection fails.
     """
     proc = execute_command(
         [
-            "docker", "inspect",
+            "docker", "image", "inspect",
             "--format", '{{range .Config.Env}}{{println .}}{{end}}',
             image,
         ],
