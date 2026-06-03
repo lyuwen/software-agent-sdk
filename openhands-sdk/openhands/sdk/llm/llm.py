@@ -846,7 +846,57 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 assert isinstance(ret, ModelResponse), (
                     f"Expected ModelResponse, got {type(ret)}"
                 )
+
+                # Check for malformed tool calls based on OH_MALFORM_PATTERNS
+                if self._check_malformed_response(ret):
+                    logger.warning(
+                        "Detected malformed tool call in response, retrying..."
+                    )
+                    # Raise an exception to trigger retry logic
+                    raise LLMNoResponseError(
+                        "Malformed tool call detected in response"
+                    )
+
                 return ret
+
+    def _check_malformed_response(self, response: ModelResponse) -> bool:
+        """Check if the response contains malformed tool calls based on patterns.
+
+        Args:
+            response: The ModelResponse from litellm_completion
+
+        Returns:
+            True if malformed patterns are detected, False otherwise
+        """
+        # Get patterns from environment variable
+        patterns_env = os.environ.get("OH_MALFORM_PATTERNS", "")
+        if not patterns_env:
+            return False
+
+        # Parse semicolon-delimited patterns
+        patterns = [p.strip() for p in patterns_env.split(";") if p.strip()]
+        if not patterns:
+            return False
+
+        # Convert response to OpenAI chat dict form and serialize to JSON
+        try:
+            response_dict = response.model_dump()
+            response_json = json.dumps(response_dict)
+
+            # Check if any pattern exists in the serialized response
+            for pattern in patterns:
+                if pattern in response_json:
+                    logger.warning(
+                        f"Malformed pattern detected: '{pattern}' found in response"
+                    )
+                    return True
+
+        except Exception as e:
+            logger.warning(f"Error checking for malformed response: {e}")
+            # If we can't check, assume it's fine rather than blocking
+            return False
+
+        return False
 
     @contextmanager
     def _litellm_modify_params_ctx(self, flag: bool):
