@@ -159,7 +159,13 @@ class WebSocketCallbackClient:
                                 "ws_event_processing_error", stack_info=True
                             )
             except websockets.exceptions.ConnectionClosed:
-                break
+                logger.info(
+                    "WebSocket connection closed for conversation %s, reconnecting...",
+                    self.conversation_id,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
+                continue
             except Exception:
                 logger.debug("ws_connect_retry", exc_info=True)
                 await asyncio.sleep(delay)
