@@ -36,4 +36,16 @@ class AsyncCallbackWrapper:
 
     def __call__(self, event: Event):
         if self.loop.is_running():
-            asyncio.run_coroutine_threadsafe(self.async_callback(event), self.loop)
+            future = asyncio.run_coroutine_threadsafe(
+                self.async_callback(event), self.loop
+            )
+            try:
+                # Wait for the callback to complete, with timeout
+                future.result(timeout=5.0)
+            except Exception as e:
+                # Log but don't raise - one failing callback shouldn't break others
+                import logging
+                logging.getLogger(__name__).error(
+                    f"Async callback failed for event {event.id}: {e}",
+                    exc_info=True,
+                )
