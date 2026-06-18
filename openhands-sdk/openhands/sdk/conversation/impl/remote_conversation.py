@@ -144,10 +144,14 @@ class WebSocketCallbackClient:
             ws_url += f"?session_api_key={self.api_key}"
 
         delay = 1.0
+        connection_attempts = 0
+        max_reconnect_attempts = 10
+
         while not self._stop.is_set():
             try:
                 async with websockets.connect(ws_url) as ws:
                     delay = 1.0
+                    connection_attempts = 0  # Reset on successful connection
                     async for message in ws:
                         if self._stop.is_set():
                             break
@@ -159,14 +163,32 @@ class WebSocketCallbackClient:
                                 "ws_event_processing_error", stack_info=True
                             )
             except websockets.exceptions.ConnectionClosed:
+                connection_attempts += 1
+                if connection_attempts >= max_reconnect_attempts:
+                    logger.warning(
+                        "WebSocket connection closed for conversation %s after %d attempts, giving up",
+                        self.conversation_id,
+                        max_reconnect_attempts,
+                    )
+                    break
                 logger.info(
-                    "WebSocket connection closed for conversation %s, reconnecting...",
+                    "WebSocket connection closed for conversation %s, reconnecting (attempt %d/%d)...",
                     self.conversation_id,
+                    connection_attempts,
+                    max_reconnect_attempts,
                 )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30.0)
                 continue
             except Exception:
+                connection_attempts += 1
+                if connection_attempts >= max_reconnect_attempts:
+                    logger.warning(
+                        "WebSocket connection failed for conversation %s after %d attempts, giving up",
+                        self.conversation_id,
+                        max_reconnect_attempts,
+                    )
+                    break
                 logger.debug("ws_connect_retry", exc_info=True)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30.0)
