@@ -35,17 +35,33 @@ class AsyncCallbackWrapper:
         self.loop = loop
 
     def __call__(self, event: Event):
-        if self.loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(
-                self.async_callback(event), self.loop
+        if not self.loop.is_running():
+            return
+
+        future = asyncio.run_coroutine_threadsafe(
+            self.async_callback(event), self.loop
+        )
+
+        # Detect same-thread call: if we're running on the same thread that
+        # owns the event loop, we cannot wait for the future (deadlock - the
+        # loop can't execute the coroutine while we're blocking it).
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        if running_loop is self.loop:
+            # Same-thread fire-and-forget; loop will pick up the coroutine
+            # when control returns to it.
+            return
+
+        try:
+            # Wait for the callback to complete, with timeout
+            future.result(timeout=5.0)
+        except Exception as e:
+            # Log but don't raise - one failing callback shouldn't break others
+            import logging
+            logging.getLogger(__name__).error(
+                f"Async callback failed for event {event.id}: {e}",
+                exc_info=True,
             )
-            try:
-                # Wait for the callback to complete, with timeout
-                future.result(timeout=5.0)
-            except Exception as e:
-                # Log but don't raise - one failing callback shouldn't break others
-                import logging
-                logging.getLogger(__name__).error(
-                    f"Async callback failed for event {event.id}: {e}",
-                    exc_info=True,
-                )
