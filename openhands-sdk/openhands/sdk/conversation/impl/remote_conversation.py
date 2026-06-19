@@ -242,9 +242,19 @@ class RemoteEventsList(EventsListBase):
                 break
             page_id = data["next_page_id"]
 
-        self._cached_events = events
-        self._cached_event_ids.update(e.id for e in events)
-        logger.debug(f"Full sync completed, {len(events)} events cached")
+        # Merge fetched events with existing cache under lock to avoid race
+        # with concurrent add_event() calls from the WebSocket thread.
+        # Events from REST may overlap with events already added via WebSocket;
+        # we preserve insertion order from the REST result, then append any
+        # WebSocket-only events that arrived during the fetch.
+        with self._lock:
+            ws_only_events = [
+                e for e in self._cached_events if e.id not in {ev.id for ev in events}
+            ]
+            self._cached_events = events + ws_only_events
+            self._cached_event_ids = {e.id for e in self._cached_events}
+        logger.debug(f"Full sync completed, {len(self._cached_events)} events cached")
+
 
     def add_event(self, event: Event) -> None:
         """Add a new event to the local cache (called by WebSocket callback)."""
