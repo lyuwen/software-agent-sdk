@@ -77,6 +77,7 @@ from openhands.sdk.llm.utils.metrics import Metrics, MetricsSnapshot
 from openhands.sdk.llm.utils.model_features import get_default_temperature, get_features
 from openhands.sdk.llm.utils.retry_mixin import RetryMixin
 from openhands.sdk.llm.utils.telemetry import Telemetry
+from openhands.sdk.llm.utils.tool_call_validation import find_invalid_tool_call
 from openhands.sdk.logger import ENV_LOG_DIR, get_logger
 
 
@@ -857,6 +858,21 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                         "Malformed tool call detected in response"
                     )
 
+                # Second guardrail: statically validate tool-call parameters
+                # against the known tool schemas (file_editor / terminal).
+                invalid = self._check_invalid_tool_call_params(ret)
+                if invalid is not None:
+                    tool_name, raw_args = invalid
+                    logger.warning(
+                        "Detected invalid tool call parameters for "
+                        f"'{tool_name}', retrying... arguments={raw_args!r}"
+                    )
+                    # Raise the same exception as the malformed check so the
+                    # outer retry logic re-issues the inference request.
+                    raise LLMNoResponseError(
+                        f"Invalid tool call parameters detected for '{tool_name}'"
+                    )
+
                 return ret
 
     def _check_malformed_response(self, response: ModelResponse) -> bool:
@@ -897,6 +913,37 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             return False
 
         return False
+
+    def _check_invalid_tool_call_params(
+        self, response: ModelResponse
+    ) -> tuple[str, str] | None:
+        """Statically validate tool-call parameters against tool schemas.
+
+        Gated by the ``OH_VALIDATE_TOOLCALL_PARAMS`` environment variable
+        (opt-in): when unset or falsy, this check is a no-op. When enabled, it
+        parses each ``file_editor``/``terminal`` tool call in the response and
+        checks its parameters against the tool's schema and per-command rules
+        (see ``tool_call_validation``). Tool calls for other tools are skipped.
+
+        Args:
+            response: The ModelResponse from litellm_completion
+
+        Returns:
+            A ``(tool_name, raw_arguments)`` tuple for the first tool call with
+            invalid parameters, or ``None`` if the check is disabled or all
+            checked calls are legal.
+        """
+        flag = os.environ.get("OH_VALIDATE_TOOLCALL_PARAMS", "")
+        if flag.strip().lower() not in ("1", "true", "yes", "on"):
+            return None
+
+        try:
+            response_dict = response.model_dump()
+            return find_invalid_tool_call(response_dict)
+        except Exception as e:
+            logger.warning(f"Error validating tool call parameters: {e}")
+            # If we can't check, assume it's fine rather than blocking.
+            return None
 
     @contextmanager
     def _litellm_modify_params_ctx(self, flag: bool):
