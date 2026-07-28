@@ -154,7 +154,8 @@ def test_unknown_tool_is_skipped(
     mock_completion, base_llm: LLM, monkeypatch
 ) -> None:
     monkeypatch.setenv("OH_VALIDATE_TOOLCALL_PARAMS", "1")
-    # A non-editor/terminal tool with arbitrary args must not be flagged.
+    # A non-editor/terminal tool with arbitrary (but well-formed JSON) args must
+    # not be flagged.
     mock_completion.side_effect = [
         _tool_call_response("finish", '{"message": "done"}', "fin-1"),
     ]
@@ -165,3 +166,106 @@ def test_unknown_tool_is_skipped(
 
     assert isinstance(resp, LLMResponse)
     assert mock_completion.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Generic JSON gate: applies to *every* tool call, including tools without a
+# dedicated schema checker. Guards against the provider failure mode where raw
+# backslash escapes (e.g. ``\Box``) make ``function.arguments`` un-parseable.
+# ---------------------------------------------------------------------------
+
+# Genuinely invalid JSON: ``\B`` is not a legal JSON escape sequence. This is
+# the shape that produced ``Invalid \escape`` at agent-side json.loads time.
+_INVALID_ESCAPE_ARGS = r'{"message": "see \Box here"}'
+
+
+@patch("openhands.sdk.llm.llm.litellm_completion")
+def test_unknown_tool_with_bad_json_is_retried(
+    mock_completion, base_llm: LLM, monkeypatch
+) -> None:
+    monkeypatch.setenv("OH_VALIDATE_TOOLCALL_PARAMS", "1")
+    # Even for a tool with no dedicated checker, un-parseable arguments must be
+    # caught by the generic gate and retried.
+    mock_completion.side_effect = [
+        _tool_call_response("finish", _INVALID_ESCAPE_ARGS, "bad-1"),
+        _tool_call_response("finish", '{"message": "done"}', "good-1"),
+    ]
+
+    resp = base_llm.completion(
+        messages=[Message(role="user", content=[TextContent(text="hi")])]
+    )
+
+    assert isinstance(resp, LLMResponse)
+    assert mock_completion.call_count == 2  # invalid JSON + 1 retry
+
+
+# ---------------------------------------------------------------------------
+# task_tracker schema checker.
+# ---------------------------------------------------------------------------
+
+# The real failing payload: a raw ``\boxed`` / ``\Box`` inside a notes field
+# makes the whole arguments string invalid JSON.
+_TASK_TRACKER_BAD_ESCAPE = (
+    r'{"command": "plan", "task_list": '
+    r'[{"title": "Find \boxed and \Box", "status": "todo", "notes": "x"}]}'
+)
+_TASK_TRACKER_VALID = (
+    '{"command": "plan", "task_list": '
+    '[{"title": "explore", "status": "in_progress", "notes": "look around"}]}'
+)
+# `plan` with no task_list is schema-invalid (task_list is required for plan).
+_TASK_TRACKER_PLAN_NO_LIST = '{"command": "plan"}'
+
+
+@patch("openhands.sdk.llm.llm.litellm_completion")
+def test_task_tracker_bad_escape_is_retried(
+    mock_completion, base_llm: LLM, monkeypatch
+) -> None:
+    monkeypatch.setenv("OH_VALIDATE_TOOLCALL_PARAMS", "1")
+    mock_completion.side_effect = [
+        _tool_call_response("task_tracker", _TASK_TRACKER_BAD_ESCAPE, "bad-1"),
+        _tool_call_response("task_tracker", _TASK_TRACKER_VALID, "good-1"),
+    ]
+
+    resp = base_llm.completion(
+        messages=[Message(role="user", content=[TextContent(text="hi")])]
+    )
+
+    assert isinstance(resp, LLMResponse)
+    assert mock_completion.call_count == 2
+
+
+@patch("openhands.sdk.llm.llm.litellm_completion")
+def test_task_tracker_plan_without_list_is_retried(
+    mock_completion, base_llm: LLM, monkeypatch
+) -> None:
+    monkeypatch.setenv("OH_VALIDATE_TOOLCALL_PARAMS", "1")
+    mock_completion.side_effect = [
+        _tool_call_response("task_tracker", _TASK_TRACKER_PLAN_NO_LIST, "bad-1"),
+        _tool_call_response("task_tracker", _TASK_TRACKER_VALID, "good-1"),
+    ]
+
+    resp = base_llm.completion(
+        messages=[Message(role="user", content=[TextContent(text="hi")])]
+    )
+
+    assert isinstance(resp, LLMResponse)
+    assert mock_completion.call_count == 2
+
+
+@patch("openhands.sdk.llm.llm.litellm_completion")
+def test_task_tracker_valid_plan_passes(
+    mock_completion, base_llm: LLM, monkeypatch
+) -> None:
+    monkeypatch.setenv("OH_VALIDATE_TOOLCALL_PARAMS", "1")
+    mock_completion.side_effect = [
+        _tool_call_response("task_tracker", _TASK_TRACKER_VALID, "good-1"),
+    ]
+
+    resp = base_llm.completion(
+        messages=[Message(role="user", content=[TextContent(text="hi")])]
+    )
+
+    assert isinstance(resp, LLMResponse)
+    assert mock_completion.call_count == 1
+

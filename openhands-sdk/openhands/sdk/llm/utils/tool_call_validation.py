@@ -9,10 +9,17 @@ problem is only visible once the arguments are parsed and checked against the
 tool's schema and per-command rules.
 
 This module provides a purely *static* checker (no tool execution, no filesystem
-access) for the two tools that dominate agent traces:
+access). It has two layers:
 
-- ``file_editor`` / ``str_replace_editor``  (string-replace file editor)
-- ``terminal`` / ``execute_bash``           (bash execution)
+- A generic JSON check applied to **every** tool call: the ``arguments`` string
+  must parse to a JSON object. This catches un-parseable arguments (e.g. raw
+  ``\boxed`` LaTeX escapes) for any tool, including ones without a schema
+  checker below.
+- Tool-specific parameter checks for the tools that dominate agent traces:
+
+  - ``file_editor`` / ``str_replace_editor``  (string-replace file editor)
+  - ``terminal`` / ``execute_bash``           (bash execution)
+  - ``task_tracker``                           (plan/view task list)
 
 The checks mirror the runtime contracts of those tools
 (``openhands.tools.file_editor`` and ``openhands.tools.terminal``) but only the
@@ -40,6 +47,7 @@ from typing import Any
 # the identical parameter schema, so we accept them as aliases.
 FILE_EDITOR_TOOL_NAMES = frozenset({"file_editor", "str_replace_editor"})
 TERMINAL_TOOL_NAMES = frozenset({"terminal", "execute_bash"})
+TASK_TRACKER_TOOL_NAMES = frozenset({"task_tracker"})
 
 # Metadata parameters some builds inject alongside the real schema fields
 # (``summary`` is a declared property in the legacy schema; ``security_risk`` is
@@ -70,6 +78,15 @@ _FILE_EDITOR_KEYS = (
 _TERMINAL_KEYS = (
     frozenset({"command", "is_input", "timeout", "reset"}) | _TOLERATED_EXTRA_KEYS
 )
+
+# Allowed values for TaskTrackerAction.command.
+_TASK_TRACKER_COMMANDS = frozenset({"view", "plan"})
+# Recognized top-level parameter keys for a task_tracker call.
+_TASK_TRACKER_KEYS = frozenset({"command", "task_list"}) | _TOLERATED_EXTRA_KEYS
+# Allowed values for TaskItem.status.
+_TASK_ITEM_STATUSES = frozenset({"todo", "in_progress", "done"})
+# Recognized keys for each TaskItem entry.
+_TASK_ITEM_KEYS = frozenset({"title", "notes", "status"})
 
 
 def _coerce_arguments(arguments: Any) -> dict[str, Any] | None:
@@ -221,20 +238,93 @@ def is_valid_terminal_call(arguments: Any) -> bool:
     return True
 
 
+def is_valid_task_tracker_call(arguments: Any) -> bool:
+    """Statically validate the parameters of a ``task_tracker`` tool call.
+
+    Mirrors ``TaskTrackerAction`` and ``TaskItem``:
+
+    - ``arguments`` parses to a JSON object with only recognized keys.
+    - ``command``, when supplied, is one of ``view`` / ``plan`` (it defaults to
+      ``view`` in the schema, so absence is legal).
+    - ``task_list``, when supplied, is a list of task objects, each of which:
+        - has only recognized keys (``title`` / ``notes`` / ``status``),
+        - has a ``title`` that is a present, non-empty string,
+        - has ``notes`` (if present) as a string,
+        - has ``status`` (if present) as one of ``todo`` / ``in_progress`` /
+          ``done``.
+    - The ``plan`` command requires a non-empty ``task_list``.
+
+    This checker exists mainly to catch the common failure mode where a model
+    emits raw LaTeX/backslash escapes (e.g. ``\\boxed``) inside the ``notes``
+    field, producing arguments that are not valid JSON at all -- those fail at
+    the ``_coerce_arguments`` parse step and trigger a retry before the agent
+    ever calls ``json.loads`` on them.
+    """
+    args = _coerce_arguments(arguments)
+    if args is None:
+        return False
+
+    # Reject unknown parameters.
+    if not set(args).issubset(_TASK_TRACKER_KEYS):
+        return False
+
+    # command: optional (defaults to "view"), must be a known literal.
+    command = args.get("command", "view")
+    if command not in _TASK_TRACKER_COMMANDS:
+        return False
+
+    task_list = args.get("task_list")
+    if task_list is not None:
+        if not isinstance(task_list, list):
+            return False
+        for item in task_list:
+            if not isinstance(item, dict):
+                return False
+            if not set(item).issubset(_TASK_ITEM_KEYS):
+                return False
+            title = item.get("title")
+            if not isinstance(title, str) or not title:
+                return False
+            notes = item.get("notes")
+            if notes is not None and not isinstance(notes, str):
+                return False
+            status = item.get("status")
+            if status is not None and status not in _TASK_ITEM_STATUSES:
+                return False
+
+    # `plan` writes the task list, so it requires a non-empty one.
+    if command == "plan" and not task_list:
+        return False
+
+    return True
+
+
 # Dispatch table: tool name -> parameter checker.
 _CHECKERS = {name: is_valid_file_editor_call for name in FILE_EDITOR_TOOL_NAMES}
 _CHECKERS.update({name: is_valid_terminal_call for name in TERMINAL_TOOL_NAMES})
-
+_CHECKERS.update({name: is_valid_task_tracker_call for name in TASK_TRACKER_TOOL_NAMES})
 
 def find_invalid_tool_call(response_dict: dict[str, Any]) -> tuple[str, str] | None:
     """Scan a ``ModelResponse.model_dump()`` dict for an invalid tool call.
 
-    Iterates every tool call across all choices, dispatches each
-    ``file_editor``/``terminal`` (and legacy-alias) call to its parameter
-    checker, and skips tool calls for any other tool. Returns a
-    ``(tool_name, raw_arguments)`` tuple for the first call that fails
-    validation, or ``None`` if all checked calls are legal (including the case
-    where no call targets a known tool).
+    Iterates every tool call across all choices and applies two layers of
+    validation:
+
+    1. A *generic* JSON check that applies to **every** tool call regardless of
+       tool name: ``function.arguments`` must parse as a JSON object. This
+       catches the common provider failure mode where the model emits raw
+       backslash escapes (e.g. ``\\boxed``) inside a string, producing arguments
+       that ``json.loads`` rejects with ``Invalid \\escape``. Without this the
+       bad call sails past the guardrail and only explodes later when the agent
+       calls ``json.loads(tool_call.arguments)``.
+    2. A *tool-specific* schema check for tools with a dedicated checker
+       (``file_editor`` / ``terminal`` / ``task_tracker`` and their legacy
+       aliases). Tool calls for any other tool clear the generic check and are
+       otherwise left alone.
+
+    Returns a ``(tool_name, raw_arguments)`` tuple for the first call that fails
+    either layer, or ``None`` if all calls are legal (including the case where
+    no call targets a known tool).
 
     The dict is expected to follow the OpenAI chat shape::
 
@@ -257,11 +347,19 @@ def find_invalid_tool_call(response_dict: dict[str, Any]) -> tuple[str, str] | N
             name = function.get("name")
             if not isinstance(name, str):
                 continue
+            arguments = function.get("arguments")
+
+            # Layer 1: generic JSON check for every tool call. A string that
+            # doesn't parse to a JSON object is malformed no matter the tool.
+            if _coerce_arguments(arguments) is None:
+                raw = arguments if isinstance(arguments, str) else repr(arguments)
+                return (name, raw)
+
+            # Layer 2: tool-specific schema check when we have a checker.
             checker = _CHECKERS.get(name)
             if checker is None:
-                # Not an editor/terminal call: skip it.
+                # Unknown tool: generic check already passed, nothing more to do.
                 continue
-            arguments = function.get("arguments")
             if not checker(arguments):
                 raw = arguments if isinstance(arguments, str) else repr(arguments)
                 return (name, raw)
