@@ -20,6 +20,7 @@ access). It has two layers:
   - ``file_editor`` / ``str_replace_editor``  (string-replace file editor)
   - ``terminal`` / ``execute_bash``           (bash execution)
   - ``task_tracker``                           (plan/view task list)
+  - ``finish`` / ``think``                     (SDK builtin tools)
 
 The checks mirror the runtime contracts of those tools
 (``openhands.tools.file_editor`` and ``openhands.tools.terminal``) but only the
@@ -48,6 +49,10 @@ from typing import Any
 FILE_EDITOR_TOOL_NAMES = frozenset({"file_editor", "str_replace_editor"})
 TERMINAL_TOOL_NAMES = frozenset({"terminal", "execute_bash"})
 TASK_TRACKER_TOOL_NAMES = frozenset({"task_tracker"})
+# SDK builtin tools (openhands.sdk.tool.builtins). ``FinishTool`` -> "finish",
+# ``ThinkTool`` -> "think".
+FINISH_TOOL_NAMES = frozenset({"finish"})
+THINK_TOOL_NAMES = frozenset({"think"})
 
 # Metadata parameters some builds inject alongside the real schema fields
 # (``summary`` is a declared property in the legacy schema; ``security_risk`` is
@@ -87,6 +92,10 @@ _TASK_TRACKER_KEYS = frozenset({"command", "task_list"}) | _TOLERATED_EXTRA_KEYS
 _TASK_ITEM_STATUSES = frozenset({"todo", "in_progress", "done"})
 # Recognized keys for each TaskItem entry.
 _TASK_ITEM_KEYS = frozenset({"title", "notes", "status"})
+
+# Recognized parameter keys for the builtin finish / think tools.
+_FINISH_KEYS = frozenset({"message"}) | _TOLERATED_EXTRA_KEYS
+_THINK_KEYS = frozenset({"thought"}) | _TOLERATED_EXTRA_KEYS
 
 
 def _coerce_arguments(arguments: Any) -> dict[str, Any] | None:
@@ -299,10 +308,63 @@ def is_valid_task_tracker_call(arguments: Any) -> bool:
     return True
 
 
+def is_valid_finish_call(arguments: Any) -> bool:
+    """Statically validate the parameters of a builtin ``finish`` tool call.
+
+    Mirrors ``FinishAction``:
+
+    - ``arguments`` parses to a JSON object with only recognized keys.
+    - ``message`` is present and a string.
+
+    ``message`` is a required field, so a call that omits it (e.g. one that only
+    supplies the tolerated ``summary`` metadata key) is rejected -- exactly the
+    failure that otherwise surfaces as a pydantic ``Field required`` error at
+    agent-side validation time.
+    """
+    args = _coerce_arguments(arguments)
+    if args is None:
+        return False
+
+    # Reject unknown parameters.
+    if not set(args).issubset(_FINISH_KEYS):
+        return False
+
+    # message: required, must be a string (may be empty).
+    if not isinstance(args.get("message"), str):
+        return False
+
+    return True
+
+
+def is_valid_think_call(arguments: Any) -> bool:
+    """Statically validate the parameters of a builtin ``think`` tool call.
+
+    Mirrors ``ThinkAction``:
+
+    - ``arguments`` parses to a JSON object with only recognized keys.
+    - ``thought`` is present and a string.
+    """
+    args = _coerce_arguments(arguments)
+    if args is None:
+        return False
+
+    # Reject unknown parameters.
+    if not set(args).issubset(_THINK_KEYS):
+        return False
+
+    # thought: required, must be a string (may be empty).
+    if not isinstance(args.get("thought"), str):
+        return False
+
+    return True
+
+
 # Dispatch table: tool name -> parameter checker.
 _CHECKERS = {name: is_valid_file_editor_call for name in FILE_EDITOR_TOOL_NAMES}
 _CHECKERS.update({name: is_valid_terminal_call for name in TERMINAL_TOOL_NAMES})
 _CHECKERS.update({name: is_valid_task_tracker_call for name in TASK_TRACKER_TOOL_NAMES})
+_CHECKERS.update({name: is_valid_finish_call for name in FINISH_TOOL_NAMES})
+_CHECKERS.update({name: is_valid_think_call for name in THINK_TOOL_NAMES})
 
 def find_invalid_tool_call(response_dict: dict[str, Any]) -> tuple[str, str] | None:
     """Scan a ``ModelResponse.model_dump()`` dict for an invalid tool call.
@@ -318,9 +380,9 @@ def find_invalid_tool_call(response_dict: dict[str, Any]) -> tuple[str, str] | N
        bad call sails past the guardrail and only explodes later when the agent
        calls ``json.loads(tool_call.arguments)``.
     2. A *tool-specific* schema check for tools with a dedicated checker
-       (``file_editor`` / ``terminal`` / ``task_tracker`` and their legacy
-       aliases). Tool calls for any other tool clear the generic check and are
-       otherwise left alone.
+       (``file_editor`` / ``terminal`` / ``task_tracker`` / ``finish`` /
+       ``think`` and their legacy aliases). Tool calls for any other tool clear
+       the generic check and are otherwise left alone.
 
     Returns a ``(tool_name, raw_arguments)`` tuple for the first call that fails
     either layer, or ``None`` if all calls are legal (including the case where

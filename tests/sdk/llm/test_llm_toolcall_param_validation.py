@@ -154,10 +154,10 @@ def test_unknown_tool_is_skipped(
     mock_completion, base_llm: LLM, monkeypatch
 ) -> None:
     monkeypatch.setenv("OH_VALIDATE_TOOLCALL_PARAMS", "1")
-    # A non-editor/terminal tool with arbitrary (but well-formed JSON) args must
-    # not be flagged.
+    # A tool with no dedicated checker and arbitrary (but well-formed JSON) args
+    # must not be flagged. `browser` has no checker in the dispatch table.
     mock_completion.side_effect = [
-        _tool_call_response("finish", '{"message": "done"}', "fin-1"),
+        _tool_call_response("browser", '{"anything": "goes"}', "b-1"),
     ]
 
     resp = base_llm.completion(
@@ -176,7 +176,7 @@ def test_unknown_tool_is_skipped(
 
 # Genuinely invalid JSON: ``\B`` is not a legal JSON escape sequence. This is
 # the shape that produced ``Invalid \escape`` at agent-side json.loads time.
-_INVALID_ESCAPE_ARGS = r'{"message": "see \Box here"}'
+_INVALID_ESCAPE_ARGS = r'{"query": "see \Box here"}'
 
 
 @patch("openhands.sdk.llm.llm.litellm_completion")
@@ -184,11 +184,11 @@ def test_unknown_tool_with_bad_json_is_retried(
     mock_completion, base_llm: LLM, monkeypatch
 ) -> None:
     monkeypatch.setenv("OH_VALIDATE_TOOLCALL_PARAMS", "1")
-    # Even for a tool with no dedicated checker, un-parseable arguments must be
-    # caught by the generic gate and retried.
+    # Even for a tool with no dedicated checker (`browser`), un-parseable
+    # arguments must be caught by the generic gate and retried.
     mock_completion.side_effect = [
-        _tool_call_response("finish", _INVALID_ESCAPE_ARGS, "bad-1"),
-        _tool_call_response("finish", '{"message": "done"}', "good-1"),
+        _tool_call_response("browser", _INVALID_ESCAPE_ARGS, "bad-1"),
+        _tool_call_response("browser", '{"query": "done"}', "good-1"),
     ]
 
     resp = base_llm.completion(
@@ -260,6 +260,90 @@ def test_task_tracker_valid_plan_passes(
     monkeypatch.setenv("OH_VALIDATE_TOOLCALL_PARAMS", "1")
     mock_completion.side_effect = [
         _tool_call_response("task_tracker", _TASK_TRACKER_VALID, "good-1"),
+    ]
+
+    resp = base_llm.completion(
+        messages=[Message(role="user", content=[TextContent(text="hi")])]
+    )
+
+    assert isinstance(resp, LLMResponse)
+    assert mock_completion.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Builtin finish / think schema checkers.
+# ---------------------------------------------------------------------------
+
+# The real failing payload: `finish` called with only the tolerated `summary`
+# metadata key and no required `message` field.
+_FINISH_MISSING_MESSAGE = (
+    '{"summary": "All issues addressed: 19 new tests pass"}'
+)
+_FINISH_VALID = '{"message": "Done: added methods, fixed behavior, tests pass."}'
+_THINK_MISSING_THOUGHT = '{"summary": "reasoning about the fix"}'
+_THINK_VALID = '{"thought": "I should check the failing tests first."}'
+
+
+@patch("openhands.sdk.llm.llm.litellm_completion")
+def test_finish_missing_message_is_retried(
+    mock_completion, base_llm: LLM, monkeypatch
+) -> None:
+    monkeypatch.setenv("OH_VALIDATE_TOOLCALL_PARAMS", "1")
+    mock_completion.side_effect = [
+        _tool_call_response("finish", _FINISH_MISSING_MESSAGE, "bad-1"),
+        _tool_call_response("finish", _FINISH_VALID, "good-1"),
+    ]
+
+    resp = base_llm.completion(
+        messages=[Message(role="user", content=[TextContent(text="hi")])]
+    )
+
+    assert isinstance(resp, LLMResponse)
+    assert mock_completion.call_count == 2
+
+
+@patch("openhands.sdk.llm.llm.litellm_completion")
+def test_finish_valid_passes(
+    mock_completion, base_llm: LLM, monkeypatch
+) -> None:
+    monkeypatch.setenv("OH_VALIDATE_TOOLCALL_PARAMS", "1")
+    mock_completion.side_effect = [
+        _tool_call_response("finish", _FINISH_VALID, "good-1"),
+    ]
+
+    resp = base_llm.completion(
+        messages=[Message(role="user", content=[TextContent(text="hi")])]
+    )
+
+    assert isinstance(resp, LLMResponse)
+    assert mock_completion.call_count == 1
+
+
+@patch("openhands.sdk.llm.llm.litellm_completion")
+def test_think_missing_thought_is_retried(
+    mock_completion, base_llm: LLM, monkeypatch
+) -> None:
+    monkeypatch.setenv("OH_VALIDATE_TOOLCALL_PARAMS", "1")
+    mock_completion.side_effect = [
+        _tool_call_response("think", _THINK_MISSING_THOUGHT, "bad-1"),
+        _tool_call_response("think", _THINK_VALID, "good-1"),
+    ]
+
+    resp = base_llm.completion(
+        messages=[Message(role="user", content=[TextContent(text="hi")])]
+    )
+
+    assert isinstance(resp, LLMResponse)
+    assert mock_completion.call_count == 2
+
+
+@patch("openhands.sdk.llm.llm.litellm_completion")
+def test_think_valid_passes(
+    mock_completion, base_llm: LLM, monkeypatch
+) -> None:
+    monkeypatch.setenv("OH_VALIDATE_TOOLCALL_PARAMS", "1")
+    mock_completion.side_effect = [
+        _tool_call_response("think", _THINK_VALID, "good-1"),
     ]
 
     resp = base_llm.completion(
