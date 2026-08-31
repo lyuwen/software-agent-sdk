@@ -36,8 +36,7 @@ rejected.
 from __future__ import annotations
 
 import json
-import re
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import Any
 
 
@@ -363,45 +362,57 @@ def is_valid_think_call(arguments: Any) -> bool:
 
 # ── parallel tool-call group validation ─────────────────────────────────────
 #
-# When a model emits *several* tool calls in one assistant turn, the calls run
-# as an unordered batch. Some combinations are structurally unsound regardless
-# of each call's individual parameters -- two writes to the same file race, a
-# read of a file written in the same batch is stale, more than one `finish`
-# has ambiguous terminal semantics, etc. These checks mirror
-# ``detect_parallel_bugs`` and operate on the *group* of calls, so they only
-# apply when a turn carries two or more tool calls.
-
-# file_editor sub-commands that mutate a file (order-dependent).
-_PARALLEL_WRITE_OPS = frozenset(
-    {"str_replace", "create", "insert", "undo_edit"}
-)
-# file_editor sub-commands that only read.
-_PARALLEL_READ_OPS = frozenset({"view"})
-# No-op shell patterns with no observable side effect.
-_TRIVIAL_SHELL_RE = re.compile(
-    r"^\s*(echo(\s+\S*)?\s*|true|false|pwd|ls\s*|whoami|id\s*|date\s*)\s*$",
-    re.IGNORECASE,
-)
+# Even though the agent executes tool calls sequentially (in response order),
+# some multi-call combinations are structurally unsound regardless of execution
+# order. The checks below only flag patterns that are wrong under *any*
+# ordering:
+#
+#   multi_finish   - more than one terminal `finish` in the group: the first
+#                    ends the conversation, the rest are unreachable.
+#   finish_mixed   - `finish` alongside non-terminal tools: contradicts the
+#                    intent of the finish call.
+#   duplicate_bash - identical shell command string issued more than once in
+#                    the same batch: always redundant for a deterministic command.
+#
+# Notably absent (deliberately):
+#   same_file_multi_write / read_write_same_file - sequential execution makes
+#     two ordered edits to the same file, or a write followed by a read, a
+#     valid and common agent pattern.  These checks would produce false
+#     positives on every such workflow.
+#   trivial_flood - too heuristic for a hard retry gate; offline analysis only.
 
 
 def find_parallel_group_bug(
     tool_calls: list[dict[str, Any]],
 ) -> tuple[str, str] | None:
-    """Detect a structural bug in a parallel (multi-call) tool-call group.
+    """Detect a structural bug in a multi-call tool-call group.
 
     Only meaningful for a group of two or more calls; a single call is never a
-    parallel group and returns ``None``. Mirrors ``detect_parallel_bugs``:
+    group and returns ``None``.
 
-      multi_finish          more than one terminal ``finish`` in the group
-      finish_mixed          ``finish`` issued alongside non-terminal tools
-      same_file_multi_write >1 mutating edit to the same path in one batch
-      read_write_same_file  a path both read and written in one batch
-      duplicate_bash        an identical shell command issued more than once
-      trivial_flood         batch dominated by no-op shell commands
+    Checks that are valid regardless of execution order:
 
-    Returns a ``(bug_tag, evidence)`` tuple for the first bug found, or ``None``
-    if the group is structurally sound. ``evidence`` is a short human-readable
-    string suitable for a retry log line.
+      multi_finish   more than one terminal ``finish`` in the group — the first
+                     ends the conversation, the rest are unreachable.
+      finish_mixed   ``finish`` issued alongside non-terminal tools —
+                     contradicts the intent of the finish call.
+      duplicate_bash identical shell command string issued more than once in
+                     the same batch — always redundant for a deterministic
+                     command.
+
+    Checks deliberately NOT performed here (sequential execution makes them
+    invalid for this runtime):
+
+      same_file_multi_write / read_write_same_file — the agent executes tool
+        calls sequentially in response order, so two ordered edits to the same
+        file, or a write followed by a read, are valid agent patterns.
+
+      trivial_flood — too heuristic for a hard retry gate; informational
+        commands like ``pwd`` and ``ls`` have real observable output and
+        rejecting small batches of them causes false positives.
+
+    Returns a ``(bug_tag, evidence)`` tuple for the first bug found, or
+    ``None`` if the group is structurally sound.
     """
     if not tool_calls or len(tool_calls) < 2:
         return None
@@ -423,35 +434,6 @@ def find_parallel_group_bug(
             f"finish issued alongside {dict(others)}",
         )
 
-    # ── file-edit conflicts ──────────────────────────────────────────────────
-    writes: dict[str, int] = defaultdict(int)
-    reads: dict[str, int] = defaultdict(int)
-    for call, name in zip(tool_calls, names):
-        function = call.get("function") if isinstance(call, dict) else None
-        args = _coerce_arguments(
-            function.get("arguments") if isinstance(function, dict) else None
-        )
-        if args is None:
-            continue
-        path = args.get("path")
-        if not path or not isinstance(path, str):
-            continue
-        # For a file editor, the operation is the sub-command; for anything
-        # else, the tool name itself is the operation.
-        op = args.get("command", "") if name in FILE_EDITOR_TOOL_NAMES else name
-        if op in _PARALLEL_WRITE_OPS:
-            writes[path] += 1
-        elif op in _PARALLEL_READ_OPS:
-            reads[path] += 1
-
-    conflicting = {p: n for p, n in writes.items() if n > 1}
-    if conflicting:
-        return ("same_file_multi_write", f"{conflicting}")
-
-    stale = sorted(set(writes) & set(reads))
-    if stale:
-        return ("read_write_same_file", f"{stale}")
-
     # ── shell command redundancy ─────────────────────────────────────────────
     bash_cmds: list[str] = []
     for call, name in zip(tool_calls, names):
@@ -467,13 +449,6 @@ def find_parallel_group_bug(
     dupes = {c: n for c, n in Counter(bash_cmds).items() if c and n > 1}
     if dupes:
         return ("duplicate_bash", f"{dupes}")
-
-    trivial = sum(1 for c in bash_cmds if _TRIVIAL_SHELL_RE.match(c))
-    if trivial >= 5 or (trivial >= 2 and trivial / len(tool_calls) >= 0.5):
-        return (
-            "trivial_flood",
-            f"{trivial} trivial of {len(tool_calls)} calls",
-        )
 
     return None
 
