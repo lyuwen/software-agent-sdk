@@ -873,6 +873,19 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                         f"Invalid tool call parameters detected for '{tool_name}'"
                     )
 
+                # Third guardrail: verify every tool call names a tool that
+                # was actually offered to the model.
+                unknown = self._check_unknown_tool_call(
+                    ret, kwargs.get("tools")
+                )
+                if unknown is not None:
+                    logger.warning(
+                        f"Detected tool call to unknown tool '{unknown}', retrying..."
+                    )
+                    raise LLMNoResponseError(
+                        f"Tool call to unknown tool '{unknown}' detected in response"
+                    )
+
                 return ret
 
     def _check_malformed_response(self, response: ModelResponse) -> bool:
@@ -944,6 +957,53 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             logger.warning(f"Error validating tool call parameters: {e}")
             # If we can't check, assume it's fine rather than blocking.
             return None
+
+    def _check_unknown_tool_call(
+        self,
+        response: ModelResponse,
+        tools: list[ChatCompletionToolParam] | None,
+    ) -> str | None:
+        """Check if any tool call in the response names a tool not in the offered list.
+
+        Gated by the ``OH_VALIDATE_TOOLCALL_PARAMS`` environment variable (same
+        opt-in as parameter validation). When no tools were offered, or the env
+        var is not set, the check is a no-op.
+
+        Args:
+            response: The ModelResponse from litellm_completion.
+            tools: The list of ChatCompletionToolParam offered to the model.
+
+        Returns:
+            The name of the first unknown tool found, or ``None`` if all tool
+            calls name known tools (or the check is disabled / not applicable).
+        """
+        flag = os.environ.get("OH_VALIDATE_TOOLCALL_PARAMS", "")
+        if flag.strip().lower() not in ("1", "true", "yes", "on"):
+            return None
+
+        if not tools:
+            return None
+
+        known_names = {
+            t["function"]["name"]
+            for t in tools
+            if t.get("type") == "function" and isinstance(t.get("function"), dict)
+        }
+
+        try:
+            for choice in response.get("choices") or []:
+                message = choice.get("message") or {}
+                tool_calls = message.get("tool_calls") or []
+                for tc in tool_calls:
+                    fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+                    name = fn.get("name") if isinstance(fn, dict) else None
+                    if name and name not in known_names:
+                        return name
+        except Exception as e:
+            logger.warning(f"Error checking unknown tool call: {e}")
+            return None
+
+        return None
 
     @contextmanager
     def _litellm_modify_params_ctx(self, flag: bool):
