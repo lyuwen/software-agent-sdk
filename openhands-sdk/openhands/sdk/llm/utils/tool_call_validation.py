@@ -405,66 +405,71 @@ _NON_EXECUTION_KEYS = frozenset({"summary", "security_risk"})
 # Fraction of the shorter view range that must be shared before two views of
 # the same file are considered redundant (50% overlap threshold).
 _VIEW_OVERLAP_THRESHOLD = 0.5
-# Matches the first path-like token after `pytest` in a shell command,
-# handling flags before the path (e.g. `pytest -q tests/foo.py`).
-_PYTEST_PATH_RE = re.compile(
-    r"pytest(?:\s+-\S+)*\s+([\w./][^\s]*)",
-    re.IGNORECASE,
-)
-# A bash command in a parallel batch is "no-op" when, after stripping the
-# segments that do no durable work on their own, nothing real is left.
-#
-# The setup/no-op segments are:
-#   - `cd`, `export`, `pushd`, `popd`, `source`, `.` — prefix actions whose
-#     effect dies with the subshell when the tool call returns, so they only
-#     matter as setup for a *following* command in the same call.
-#   - `echo <literal>` — its output has nowhere to go inside a standalone
-#     call, so it is padding. `echo $VAR` (env inspection) and command
-#     substitution are NOT padding; the regex excludes `$` and backticks.
-#
-# A command is no-op when every `;`/`&&`-separated segment is one of the
-# above. `["cd a", "cd b"]` and `["cd /x; echo hi", ...]` are therefore both
-# no-op; `cd /x && pytest` is not (pytest is real work). A `|` pipe means the
-# stdout is consumed downstream, so the command is never no-op. `ls`, `pwd`,
-# and other inspection commands are real work and are never stripped.
-# A bare `echo` that writes to a file is durable, so redirection characters
-# (`>`, `<`) must be excluded alongside pipes and chaining operators. Without
-# that exclusion, `echo ready > status.txt` looks like a no-op literal echo.
+# A bash command in a parallel batch is a no-op when the only work it does
+# is emit a bare echo literal. Commands that persist across calls in this
+# terminal (cd, export, source, pushd, popd, etc. — see terminal/definition.py:208)
+# are real work and are NOT classified as no-ops.
 _PADDING_ECHO_RE = re.compile(
     r"^\s*echo\b[^\n&|;`$<>]*$", re.IGNORECASE
-)
-_PREFIX_ACTION_RE = re.compile(
-    r"^\s*(cd|export|pushd|popd|source|\.)\b[^\n&|;`$]*$", re.IGNORECASE
 )
 
 
 def _is_noop_bash(cmd: str) -> bool:
     """Whether a bash command does no durable work.
 
-    Splits on the sequential separators `;` and `&&` and checks whether every
-    resulting segment is either a prefix action (cd/export/…) or a padding
-    echo. If so, the command's only "work" is setup that evaporates plus
-    literal output that goes nowhere. A `|` pipe means stdout feeds a real
-    consumer, so the command is treated as real work.
+    In this SDK's terminal the session is stateful: ``cd``, ``export``,
+    ``source``, ``pushd``, ``popd``, and ``.`` all persist across calls
+    (documented in terminal/definition.py:208).  Only a bare ``echo
+    <literal>`` — no chaining operator, no redirection, no ``$`` variable
+    reference, no command substitution — is a no-op.  A single echo with
+    any of those features (``echo $VAR``, ``echo x > file``, ``echo x &&
+    cmd``) is not flagged.
     """
     if "|" in cmd:
         return False
     segments = [s for s in re.split(r"&&|;", cmd) if s.strip()]
     if not segments:
         return False
-    return all(
-        _PREFIX_ACTION_RE.match(s) or _PADDING_ECHO_RE.match(s) for s in segments
-    )
+    return all(_PADDING_ECHO_RE.match(s) for s in segments)
 
 
 def _pytest_path(cmd: str) -> str | None:
-    """Return the first path argument to pytest in a shell command, or None."""
-    m = _PYTEST_PATH_RE.search(cmd)
+    """Return the first path-like argument to pytest in a shell command.
+
+    Scans tokens after 'pytest', skipping flags (starting with '-') and their
+    argument values (tokens immediately following a flag that takes a value,
+    identified by a known set of such flags). Returns the first token that
+    looks like a file/directory path: contains '/', ends in '.py', or contains
+    '::' (pytest node-id separator).
+    """
+    # Flags that consume the next token as their value (not a path).
+    _FLAGS_WITH_VALUE = frozenset({
+        "-k", "-m", "-n", "--timeout", "--rootdir", "--basetemp",
+        "--ignore", "--collect-only", "-p", "--override-ini",
+        "--config-file", "--co", "-x", "--maxfail", "--tb",
+        "--log-level", "--log-file", "--log-format",
+    })
+    # Find pytest invocation (handles `python -m pytest ...` too).
+    m = re.search(r"\bpytest\b", cmd, re.IGNORECASE)
     if not m:
         return None
-    token = m.group(1).split()[0]  # stop at first whitespace/flag
-    # Skip bare flags like -q, -x, -k, etc.
-    return None if token.startswith("-") else token
+    rest = cmd[m.end():]
+    tokens = rest.split()
+    skip_next = False
+    for token in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if token.startswith("-"):
+            # Check if this flag takes a value and is written as --flag value
+            # (as opposed to --flag=value which would include = in the token).
+            if "=" not in token and token in _FLAGS_WITH_VALUE:
+                skip_next = True
+            continue
+        # A path token: contains a path separator, ends with .py, or has ::
+        if "/" in token or "\\" in token or token.endswith(".py") or "::" in token:
+            return token
+    return None
 
 
 def _ranges_overlap(a: Any, b: Any) -> bool:
@@ -514,6 +519,20 @@ def find_parallel_group_bug(
     """
     if not tool_calls or len(tool_calls) < 2:
         return None
+
+    # ── batch ceiling first (O(1)) ───────────────────────────────────────────
+    # Check before any pairwise work to short-circuit on pathological batches.
+    try:
+        max_batch = int(
+            os.environ.get("OH_MAX_TOOLCALL_BATCH_SIZE", _DEFAULT_MAX_BATCH)
+        )
+    except (ValueError, TypeError):
+        max_batch = _DEFAULT_MAX_BATCH
+    if len(tool_calls) > max_batch:
+        return (
+            "batch_too_large",
+            f"{len(tool_calls)} calls exceeds ceiling of {max_batch}",
+        )
 
     # Unpack names and parsed args once.
     names: list[str] = []
