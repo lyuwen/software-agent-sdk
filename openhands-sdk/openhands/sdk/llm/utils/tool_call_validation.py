@@ -36,7 +36,9 @@ rejected.
 from __future__ import annotations
 
 import json
-from collections import Counter
+import os
+import re
+from collections import Counter, defaultdict
 from typing import Any
 
 
@@ -362,24 +364,78 @@ def is_valid_think_call(arguments: Any) -> bool:
 
 # ── parallel tool-call group validation ─────────────────────────────────────
 #
-# Even though the agent executes tool calls sequentially (in response order),
-# some multi-call combinations are structurally unsound regardless of execution
-# order. The checks below only flag patterns that are wrong under *any*
-# ordering:
+# When a model emits several tool calls in one turn, the agent executes them
+# sequentially in response order. However, the model generates all calls
+# without seeing any intermediate result, so from the model's perspective the
+# batch is effectively blind. The checks below reject combinations that are
+# structurally unsound under that blind-generation assumption:
 #
-#   multi_finish   - more than one terminal `finish` in the group: the first
-#                    ends the conversation, the rest are unreachable.
-#   finish_mixed   - `finish` alongside non-terminal tools: contradicts the
-#                    intent of the finish call.
-#   duplicate_bash - identical shell command string issued more than once in
-#                    the same batch: always redundant for a deterministic command.
-#
-# Notably absent (deliberately):
-#   same_file_multi_write / read_write_same_file - sequential execution makes
-#     two ordered edits to the same file, or a write followed by a read, a
-#     valid and common agent pattern.  These checks would produce false
-#     positives on every such workflow.
-#   trivial_flood - too heuristic for a hard retry gate; offline analysis only.
+#   exact_duplicate        Same (name, arguments) pair more than once. Always
+#                          redundant: same input → same output.
+#   finish_not_alone       finish must be the only call in its batch.
+#   same_location_write    >1 mutating edit to the same (path, location):
+#                          - str_replace: same path + same old_str
+#                          - create:      same path (whole file is the target)
+#                          - insert:      same path + same insert_line
+#                          - undo_edit:   same path (always whole-file target)
+#                          Distinct hunks on the same file are allowed.
+#   overlapping_view       >1 view of the same path with overlapping view_range.
+#                          Viewing distinct line ranges is allowed.
+#   read_write_same_file   A view and any write on the same path.
+#   same_scope_multi_test  >1 pytest invocation whose test-path is identical
+#                          or one is a prefix of the other.
+#   no_op_bash_only        All bash calls in the batch are no-op shell
+#                          commands (echo, true, false, pwd, ls, whoami, id,
+#                          date). A batch composed only of these does nothing.
+#   batch_too_large        Batch exceeds OH_MAX_TOOLCALL_BATCH_SIZE (default
+#                          16). Last-resort circuit breaker.
+
+# file_editor sub-commands that mutate a file.
+_WRITE_OPS = frozenset({"str_replace", "create", "insert", "undo_edit"})
+# file_editor sub-commands that only read.
+_READ_OPS = frozenset({"view"})
+# Default batch-size ceiling (overridable via env).
+_DEFAULT_MAX_BATCH = 16
+# Matches the first path-like token after `pytest` in a shell command.
+_PYTEST_PATH_RE = re.compile(
+    r"pytest\s+([\w./][^\s]*)",
+    re.IGNORECASE,
+)
+# No-op shell commands with no observable side effect on the repo. A batch
+# composed only of these is not doing real work.
+_TRIVIAL_SHELL_RE = re.compile(
+    r"^\s*(echo(\s+.*)?|true|false|pwd|ls(\s+.*)?|whoami|id|date|:)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _pytest_path(cmd: str) -> str | None:
+    """Return the first path argument to pytest in a shell command, or None."""
+    m = _PYTEST_PATH_RE.search(cmd)
+    if not m:
+        return None
+    token = m.group(1).split()[0]  # stop at first whitespace/flag
+    # Skip bare flags like -q, -x, -k, etc.
+    return None if token.startswith("-") else token
+
+
+def _ranges_overlap(a: Any, b: Any) -> bool:
+    """Whether two file_editor ``view_range`` values cover any common line.
+
+    A missing/None range means "whole file", which overlaps everything. A
+    range is ``[start, end]`` where ``end == -1`` means end-of-file.
+    """
+    if not isinstance(a, list) or len(a) != 2:
+        return True  # whole file
+    if not isinstance(b, list) or len(b) != 2:
+        return True  # whole file
+    a0, a1 = a
+    b0, b1 = b
+    if not all(isinstance(x, int) for x in (a0, a1, b0, b1)):
+        return True  # can't reason about it: treat as overlapping
+    a_end = float("inf") if a1 == -1 else a1
+    b_end = float("inf") if b1 == -1 else b1
+    return a0 <= b_end and b0 <= a_end
 
 
 def find_parallel_group_bug(
@@ -387,68 +443,170 @@ def find_parallel_group_bug(
 ) -> tuple[str, str] | None:
     """Detect a structural bug in a multi-call tool-call group.
 
-    Only meaningful for a group of two or more calls; a single call is never a
-    group and returns ``None``.
-
-    Checks that are valid regardless of execution order:
-
-      multi_finish   more than one terminal ``finish`` in the group — the first
-                     ends the conversation, the rest are unreachable.
-      finish_mixed   ``finish`` issued alongside non-terminal tools —
-                     contradicts the intent of the finish call.
-      duplicate_bash identical shell command string issued more than once in
-                     the same batch — always redundant for a deterministic
-                     command.
-
-    Checks deliberately NOT performed here (sequential execution makes them
-    invalid for this runtime):
-
-      same_file_multi_write / read_write_same_file — the agent executes tool
-        calls sequentially in response order, so two ordered edits to the same
-        file, or a write followed by a read, are valid agent patterns.
-
-      trivial_flood — too heuristic for a hard retry gate; informational
-        commands like ``pwd`` and ``ls`` have real observable output and
-        rejecting small batches of them causes false positives.
-
-    Returns a ``(bug_tag, evidence)`` tuple for the first bug found, or
-    ``None`` if the group is structurally sound.
+    Only meaningful for two or more calls; returns ``None`` for a single call.
+    Returns a ``(bug_tag, evidence)`` tuple for the first violation found, or
+    ``None`` if the group is structurally sound. Bug tags correspond to the
+    checks described in the module-level comment block above.
     """
     if not tool_calls or len(tool_calls) < 2:
         return None
 
+    # Unpack names and args once.
     names: list[str] = []
+    raw_args: list[str] = []
+    parsed_args: list[dict[str, Any] | None] = []
     for call in tool_calls:
-        function = call.get("function") if isinstance(call, dict) else None
-        name = function.get("name") if isinstance(function, dict) else None
+        fn = call.get("function") if isinstance(call, dict) else None
+        name = fn.get("name") if isinstance(fn, dict) else None
         names.append(name if isinstance(name, str) else "")
+        arguments = fn.get("arguments") if isinstance(fn, dict) else None
+        raw = arguments if isinstance(arguments, str) else ""
+        raw_args.append(raw)
+        parsed_args.append(_coerce_arguments(arguments))
 
-    # ── terminal-action coherence ────────────────────────────────────────────
+    # ── 1. exact duplicate ───────────────────────────────────────────────────
+    seen: set[tuple[str, str]] = set()
+    for name, raw in zip(names, raw_args):
+        key = (name, raw)
+        if key in seen:
+            return ("exact_duplicate", f"{name!r} issued more than once with identical arguments")
+        seen.add(key)
+
+    # ── 2. finish must be alone ──────────────────────────────────────────────
     finish_n = sum(1 for n in names if n in FINISH_TOOL_NAMES)
-    if finish_n > 1:
-        return ("multi_finish", f"{finish_n} finish calls in one batch")
-    if finish_n >= 1 and (len(names) - finish_n) >= 1:
+    if finish_n >= 1 and len(names) > 1:
         others = Counter(n for n in names if n not in FINISH_TOOL_NAMES)
         return (
-            "finish_mixed",
-            f"finish issued alongside {dict(others)}",
+            "finish_not_alone",
+            f"finish in a batch of {len(names)}: also contains {dict(others)}",
         )
 
-    # ── shell command redundancy ─────────────────────────────────────────────
-    bash_cmds: list[str] = []
-    for call, name in zip(tool_calls, names):
-        if name not in TERMINAL_TOOL_NAMES:
+    # ── 3. same-location write conflict ─────────────────────────────────────
+    # Each write is keyed by (path, location_key) so distinct hunks on the
+    # same file are allowed, but the same hunk (or whole-file ops like create
+    # and undo_edit) are not.
+    #
+    # str_replace  → location = old_str   (the consumed hunk)
+    # create       → location = ""        (whole file)
+    # insert       → location = insert_line as str
+    # undo_edit    → location = ""        (whole file; multiple undos on the
+    #                                      same file are nonsensical since the
+    #                                      first undo changes what the second
+    #                                      would act on)
+    write_locations: Counter[tuple[str, str]] = Counter()
+    for name, args in zip(names, parsed_args):
+        if name not in FILE_EDITOR_TOOL_NAMES or args is None:
             continue
-        function = call.get("function") if isinstance(call, dict) else None
-        args = _coerce_arguments(
-            function.get("arguments") if isinstance(function, dict) else None
-        )
-        cmd = args.get("command", "") if args else ""
-        bash_cmds.append(cmd.strip() if isinstance(cmd, str) else "")
+        op = args.get("command", "")
+        if op not in _WRITE_OPS:
+            continue
+        path = args.get("path", "")
+        if not path:
+            continue
+        if op == "str_replace":
+            loc = args.get("old_str", "")
+        elif op == "create":
+            loc = ""
+        elif op == "insert":
+            loc = str(args.get("insert_line", ""))
+        else:  # undo_edit
+            loc = ""
+        write_locations[(path, loc)] += 1
 
-    dupes = {c: n for c, n in Counter(bash_cmds).items() if c and n > 1}
-    if dupes:
-        return ("duplicate_bash", f"{dupes}")
+    conflict = next(
+        ((p, l) for (p, l), n in write_locations.items() if n > 1), None
+    )
+    if conflict is not None:
+        path, loc = conflict
+        detail = f"path={path!r}" + (f" old_str={loc!r}" if loc else "")
+        return ("same_location_write", detail)
+
+    # ── 4. overlapping view ranges on the same file ─────────────────────────
+    # Multiple views of the same file are fine as long as the ranges are
+    # disjoint. A missing range means "whole file".
+    views_by_path: dict[str, list[Any]] = defaultdict(list)
+    for name, args in zip(names, parsed_args):
+        if name not in FILE_EDITOR_TOOL_NAMES or args is None:
+            continue
+        if args.get("command", "") not in _READ_OPS:
+            continue
+        path = args.get("path", "")
+        if not path:
+            continue
+        views_by_path[path].append(args.get("view_range"))
+
+    for path, ranges in views_by_path.items():
+        if len(ranges) < 2:
+            continue
+        for i, a in enumerate(ranges):
+            for b in ranges[i + 1:]:
+                if _ranges_overlap(a, b):
+                    return (
+                        "overlapping_view",
+                        f"path={path!r} view_range {a!r} overlaps {b!r}",
+                    )
+
+    # ── 5. read + write on same file ────────────────────────────────────────
+    write_paths: set[str] = {p for (p, _) in write_locations}
+    read_paths: set[str] = set(views_by_path)
+    rw_conflict = sorted(read_paths & write_paths)
+    if rw_conflict:
+        return ("read_write_same_file", f"paths={rw_conflict}")
+
+    # ── 6. same pytest scope issued more than once ───────────────────────────
+    test_paths: list[str] = []
+    for name, args in zip(names, parsed_args):
+        if name not in TERMINAL_TOOL_NAMES or args is None:
+            continue
+        cmd = args.get("command", "")
+        if not isinstance(cmd, str):
+            continue
+        tp = _pytest_path(cmd)
+        if tp:
+            test_paths.append(tp)
+
+    if len(test_paths) >= 2:
+        for i, a in enumerate(test_paths):
+            for b in test_paths[i + 1:]:
+                shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+                if (
+                    longer == shorter
+                    or longer.startswith(shorter.rstrip("/") + "/")
+                    or longer.startswith(shorter.rstrip("/") + "::")
+                ):
+                    return (
+                        "same_scope_multi_test",
+                        f"pytest scopes overlap: {a!r} and {b!r}",
+                    )
+
+    # ── 7. batch of nothing but no-op shell commands ─────────────────────────
+    # A batch where every bash call is a no-op (echo, pwd, ls, true, …) does
+    # no real work. We only flag it when ALL bash calls in the batch are
+    # trivial and there are at least two of them — a lone echo alongside a
+    # real command is fine.
+    bash_cmds = [
+        (args.get("command", "") if args else "")
+        for name, args in zip(names, parsed_args)
+        if name in TERMINAL_TOOL_NAMES
+    ]
+    if len(bash_cmds) >= 2 and all(
+        isinstance(c, str) and _TRIVIAL_SHELL_RE.match(c) for c in bash_cmds
+    ):
+        return (
+            "no_op_bash_only",
+            f"all {len(bash_cmds)} bash calls in batch are no-op commands",
+        )
+
+    # ── 8. batch ceiling (last-resort circuit breaker) ───────────────────────
+    try:
+        max_batch = int(os.environ.get("OH_MAX_TOOLCALL_BATCH_SIZE", _DEFAULT_MAX_BATCH))
+    except (ValueError, TypeError):
+        max_batch = _DEFAULT_MAX_BATCH
+    if len(tool_calls) > max_batch:
+        return (
+            "batch_too_large",
+            f"{len(tool_calls)} calls exceeds ceiling of {max_batch}",
+        )
 
     return None
 
@@ -459,6 +617,7 @@ _CHECKERS.update({name: is_valid_terminal_call for name in TERMINAL_TOOL_NAMES})
 _CHECKERS.update({name: is_valid_task_tracker_call for name in TASK_TRACKER_TOOL_NAMES})
 _CHECKERS.update({name: is_valid_finish_call for name in FINISH_TOOL_NAMES})
 _CHECKERS.update({name: is_valid_think_call for name in THINK_TOOL_NAMES})
+
 
 def find_invalid_tool_call(response_dict: dict[str, Any]) -> tuple[str, str] | None:
     """Scan a ``ModelResponse.model_dump()`` dict for an invalid tool call.
