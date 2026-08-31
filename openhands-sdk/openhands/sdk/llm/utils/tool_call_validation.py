@@ -384,11 +384,12 @@ def is_valid_think_call(arguments: Any) -> bool:
 #   read_write_same_file   A view and any write on the same path.
 #   same_scope_multi_test  >1 pytest invocation whose test-path is identical
 #                          or one is a prefix of the other.
-#   padding_echo           A bare `echo <literal>` (no chaining operator, no
-#                          $VAR reference, no command substitution) in a
-#                          multi-call batch. Its output has nowhere to go, so
-#                          it is padding. `echo $VAR`, chained echoes, and
-#                          standalone `ls`/`pwd`/etc. are all allowed.
+#   noop_bash              A bash call whose every segment is a prefix action
+#                          (cd/export/…) or a bare echo literal — no durable
+#                          work survives the subshell. Catches bare `cd a`,
+#                          `cd /x; echo hi`, plain `echo hi`, and any mix.
+#                          Allows `echo $VAR`, piped commands, and real work
+#                          like `cd /x && pytest tests/`.
 #   batch_too_large        Batch exceeds OH_MAX_TOOLCALL_BATCH_SIZE (default
 #                          16). Last-resort circuit breaker.
 
@@ -403,50 +404,45 @@ _PYTEST_PATH_RE = re.compile(
     r"pytest\s+([\w./][^\s]*)",
     re.IGNORECASE,
 )
-# A `echo <literal>` in a parallel batch is padding: its output only becomes
-# useful when piped or chained into a *following* command that consumes it,
-# which cannot exist inside a single standalone tool call. A bare `echo $VAR`
-# (or a command substitution) is exempt — it reports state the agent can act
-# on. So is `echo x && real_cmd`, where the echo feeds real work.
+# A bash command in a parallel batch is "no-op" when, after stripping the
+# segments that do no durable work on their own, nothing real is left.
 #
-# Prefix actions like `cd`, `export`, `pushd`, and `popd` are stripped before
-# the decision: their effect dies with the subshell when the tool call
-# returns, so `cd /x; echo hi` is just as much padding as bare `echo hi`. We
-# strip leading prefix segments and, if all that remains is a padding echo,
-# flag it. `ls`, `pwd`, and other inspection commands are NOT stripped and are
-# never flagged on their own.
+# The setup/no-op segments are:
+#   - `cd`, `export`, `pushd`, `popd`, `source`, `.` — prefix actions whose
+#     effect dies with the subshell when the tool call returns, so they only
+#     matter as setup for a *following* command in the same call.
+#   - `echo <literal>` — its output has nowhere to go inside a standalone
+#     call, so it is padding. `echo $VAR` (env inspection) and command
+#     substitution are NOT padding; the regex excludes `$` and backticks.
+#
+# A command is no-op when every `;`/`&&`-separated segment is one of the
+# above. `["cd a", "cd b"]` and `["cd /x; echo hi", ...]` are therefore both
+# no-op; `cd /x && pytest` is not (pytest is real work). A `|` pipe means the
+# stdout is consumed downstream, so the command is never no-op. `ls`, `pwd`,
+# and other inspection commands are real work and are never stripped.
 _PADDING_ECHO_RE = re.compile(r"^\s*echo\b[^\n&|;`$]*$", re.IGNORECASE)
-# A leading segment that only sets up state for what follows.
 _PREFIX_ACTION_RE = re.compile(
     r"^\s*(cd|export|pushd|popd|source|\.)\b[^\n&|;`$]*$", re.IGNORECASE
 )
 
 
-def _is_padding_echo(cmd: str) -> bool:
-    """Whether cmd reduces to a bare `echo <literal>` after stripping prefixes.
+def _is_noop_bash(cmd: str) -> bool:
+    """Whether a bash command does no durable work.
 
-    Splits on `;` and `&&` (sequential separators that do not consume the
-    previous command's stdout). Leading segments that are pure prefix actions
-    (cd/export/…) are dropped; if every remaining segment is a padding echo,
-    the command does no real work and is flagged. A `|` pipe or a `$` / backtick
-    anywhere keeps the command out of scope — those may feed or report real
-    state.
+    Splits on the sequential separators `;` and `&&` and checks whether every
+    resulting segment is either a prefix action (cd/export/…) or a padding
+    echo. If so, the command's only "work" is setup that evaporates plus
+    literal output that goes nowhere. A `|` pipe means stdout feeds a real
+    consumer, so the command is treated as real work.
     """
-    # A pipe means stdout is consumed downstream; treat as real work.
     if "|" in cmd:
         return False
-    # Split only on sequential separators (`;`, `&&`). Command substitution and
-    # variable refs are handled by the per-segment echo regex (it rejects `$`).
     segments = [s for s in re.split(r"&&|;", cmd) if s.strip()]
     if not segments:
         return False
-    remaining = [s for s in segments if not _PREFIX_ACTION_RE.match(s)]
-    if not remaining:
-        # Nothing but prefix actions (e.g. `cd /x`): not an echo, not flagged
-        # here — a lone `cd` is caught by exact-duplicate / batch rules if at
-        # all, and on its own is harmless.
-        return False
-    return all(_PADDING_ECHO_RE.match(s) for s in remaining)
+    return all(
+        _PREFIX_ACTION_RE.match(s) or _PADDING_ECHO_RE.match(s) for s in segments
+    )
 
 
 def _pytest_path(cmd: str) -> str | None:
@@ -632,12 +628,12 @@ def find_parallel_group_bug(
         for name, args in zip(names, parsed_args)
         if name in TERMINAL_TOOL_NAMES
         and isinstance((args or {}).get("command"), str)
-        and _is_padding_echo((args or {}).get("command", ""))
+        and _is_noop_bash((args or {}).get("command", ""))
     ]
     if padding_echoes:
         return (
-            "padding_echo",
-            f"bare echo with no chaining or variable reference: {padding_echoes!r}",
+            "noop_bash",
+            f"bash call(s) with no durable work: {padding_echoes!r}",
         )
 
     # ── 8. batch ceiling (last-resort circuit breaker) ───────────────────────
