@@ -98,7 +98,12 @@ def _check_unknown_tool(
     response: ModelResponse,
     tools: list[ChatCompletionToolParam] | None,
 ) -> LLMResponseValidationError | None:
-    """Return an error if a tool call names a tool not in the offered list."""
+    """Return an error if a tool call names a tool not in the offered list.
+
+    Uses ``response.model_dump()`` so tool calls are plain dicts rather than
+    typed ``ChatCompletionMessageToolCall`` objects, which do not support
+    ``.get()``.
+    """
     flag = os.environ.get("OH_VALIDATE_TOOLCALL_PARAMS", "")
     if flag.strip().lower() not in ("1", "true", "yes", "on"):
         return None
@@ -110,11 +115,12 @@ def _check_unknown_tool(
         if t.get("type") == "function" and isinstance(t.get("function"), dict)
     }
     try:
-        for choice in response.get("choices") or []:
+        response_dict = response.model_dump()
+        for choice in response_dict.get("choices") or []:
             message = choice.get("message") or {}
             for tc in message.get("tool_calls") or []:
-                fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
-                name = fn.get("name") if isinstance(fn, dict) else None
+                fn = tc.get("function") or {}
+                name = fn.get("name")
                 if name and name not in known_names:
                     logger.warning(
                         f"Detected tool call to unknown tool '{name}'"
@@ -145,19 +151,28 @@ def _validate(
 def _annotate_response(
     response: ModelResponse, error: LLMResponseValidationError
 ) -> None:
-    """Stamp the last validation error onto the first choice's message."""
+    """Stamp the last validation error onto the first choice's message.
+
+    Writes into the typed ``Message`` object directly (not via model_dump)
+    so the annotation survives into the response returned to the caller.
+    ``response.choices`` contains ``Choices`` objects (not ``StreamingChoices``)
+    for completed completions; only ``Choices`` has a ``message`` attribute.
+    """
     try:
-        choices = response.get("choices") or []
+        choices = response.choices
         if not choices:
             return
-        message = choices[0].get("message")
-        if not isinstance(message, dict):
+        first = choices[0]
+        # StreamingChoices has no .message; skip silently if that's what we got.
+        message = getattr(first, "message", None)
+        if message is None:
             return
-        psf = message.get("provider_specific_fields")
+        psf = getattr(message, "provider_specific_fields", None)
         if psf is None:
             psf = {}
-            message["provider_specific_fields"] = psf
-        psf["annotation"] = str(error)
+            message.provider_specific_fields = psf  # type: ignore[attr-defined]
+        if isinstance(psf, dict):
+            psf["annotation"] = str(error)
     except Exception as exc:
         logger.warning(f"Failed to annotate response with validation error: {exc}")
 
