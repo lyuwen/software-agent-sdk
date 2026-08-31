@@ -436,37 +436,38 @@ def _is_noop_bash(cmd: str) -> bool:
 def _pytest_path(cmd: str) -> str | None:
     """Return the first path-like argument to pytest in a shell command.
 
-    Scans tokens after 'pytest', skipping flags (starting with '-') and their
-    argument values (tokens immediately following a flag that takes a value,
-    identified by a known set of such flags). Returns the first token that
-    looks like a file/directory path: contains '/', ends in '.py', or contains
-    '::' (pytest node-id separator).
+    Scans tokens after 'pytest', skipping boolean flags (e.g. -v, -x,
+    --collect-only) and the values of flags that take an argument (e.g.
+    -k expr, --rootdir /tmp). Returns the first token that looks like a
+    file-system path or pytest node-id: contains '/', ends with '.py',
+    or contains '::'.
+
+    Flags are classified as value-consuming only when they are in the
+    explicit set below; every other flag token is treated as boolean and
+    skipped without consuming the next token.
     """
-    # Flags that consume the next token as their value (not a path).
+    # Only flags whose next token is a value, not a path.
     _FLAGS_WITH_VALUE = frozenset({
-        "-k", "-m", "-n", "--timeout", "--rootdir", "--basetemp",
-        "--ignore", "--collect-only", "-p", "--override-ini",
-        "--config-file", "--co", "-x", "--maxfail", "--tb",
+        "-k", "-m", "-n", "-p",
+        "--timeout", "--rootdir", "--basetemp", "--ignore",
+        "--override-ini", "--config-file", "--maxfail", "--tb",
         "--log-level", "--log-file", "--log-format",
     })
-    # Find pytest invocation (handles `python -m pytest ...` too).
     m = re.search(r"\bpytest\b", cmd, re.IGNORECASE)
     if not m:
         return None
-    rest = cmd[m.end():]
-    tokens = rest.split()
+    tokens = cmd[m.end():].split()
     skip_next = False
     for token in tokens:
         if skip_next:
             skip_next = False
             continue
         if token.startswith("-"):
-            # Check if this flag takes a value and is written as --flag value
-            # (as opposed to --flag=value which would include = in the token).
+            # Only consume the next token as a value when the flag is in
+            # the explicit set and written as --flag value (not --flag=val).
             if "=" not in token and token in _FLAGS_WITH_VALUE:
                 skip_next = True
             continue
-        # A path token: contains a path separator, ends with .py, or has ::
         if "/" in token or "\\" in token or token.endswith(".py") or "::" in token:
             return token
     return None
