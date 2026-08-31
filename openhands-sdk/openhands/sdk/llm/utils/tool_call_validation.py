@@ -384,9 +384,11 @@ def is_valid_think_call(arguments: Any) -> bool:
 #   read_write_same_file   A view and any write on the same path.
 #   same_scope_multi_test  >1 pytest invocation whose test-path is identical
 #                          or one is a prefix of the other.
-#   no_op_bash_only        All bash calls in the batch are no-op shell
-#                          commands (echo, true, false, pwd, ls, whoami, id,
-#                          date). A batch composed only of these does nothing.
+#   padding_echo           A bare `echo <literal>` (no chaining operator, no
+#                          $VAR reference, no command substitution) in a
+#                          multi-call batch. Its output has nowhere to go, so
+#                          it is padding. `echo $VAR`, chained echoes, and
+#                          standalone `ls`/`pwd`/etc. are all allowed.
 #   batch_too_large        Batch exceeds OH_MAX_TOOLCALL_BATCH_SIZE (default
 #                          16). Last-resort circuit breaker.
 
@@ -401,12 +403,50 @@ _PYTEST_PATH_RE = re.compile(
     r"pytest\s+([\w./][^\s]*)",
     re.IGNORECASE,
 )
-# No-op shell commands with no observable side effect on the repo. A batch
-# composed only of these is not doing real work.
-_TRIVIAL_SHELL_RE = re.compile(
-    r"^\s*(echo(\s+.*)?|true|false|pwd|ls(\s+.*)?|whoami|id|date|:)\s*$",
-    re.IGNORECASE,
+# A `echo <literal>` in a parallel batch is padding: its output only becomes
+# useful when piped or chained into a *following* command that consumes it,
+# which cannot exist inside a single standalone tool call. A bare `echo $VAR`
+# (or a command substitution) is exempt — it reports state the agent can act
+# on. So is `echo x && real_cmd`, where the echo feeds real work.
+#
+# Prefix actions like `cd`, `export`, `pushd`, and `popd` are stripped before
+# the decision: their effect dies with the subshell when the tool call
+# returns, so `cd /x; echo hi` is just as much padding as bare `echo hi`. We
+# strip leading prefix segments and, if all that remains is a padding echo,
+# flag it. `ls`, `pwd`, and other inspection commands are NOT stripped and are
+# never flagged on their own.
+_PADDING_ECHO_RE = re.compile(r"^\s*echo\b[^\n&|;`$]*$", re.IGNORECASE)
+# A leading segment that only sets up state for what follows.
+_PREFIX_ACTION_RE = re.compile(
+    r"^\s*(cd|export|pushd|popd|source|\.)\b[^\n&|;`$]*$", re.IGNORECASE
 )
+
+
+def _is_padding_echo(cmd: str) -> bool:
+    """Whether cmd reduces to a bare `echo <literal>` after stripping prefixes.
+
+    Splits on `;` and `&&` (sequential separators that do not consume the
+    previous command's stdout). Leading segments that are pure prefix actions
+    (cd/export/…) are dropped; if every remaining segment is a padding echo,
+    the command does no real work and is flagged. A `|` pipe or a `$` / backtick
+    anywhere keeps the command out of scope — those may feed or report real
+    state.
+    """
+    # A pipe means stdout is consumed downstream; treat as real work.
+    if "|" in cmd:
+        return False
+    # Split only on sequential separators (`;`, `&&`). Command substitution and
+    # variable refs are handled by the per-segment echo regex (it rejects `$`).
+    segments = [s for s in re.split(r"&&|;", cmd) if s.strip()]
+    if not segments:
+        return False
+    remaining = [s for s in segments if not _PREFIX_ACTION_RE.match(s)]
+    if not remaining:
+        # Nothing but prefix actions (e.g. `cd /x`): not an echo, not flagged
+        # here — a lone `cd` is caught by exact-duplicate / batch rules if at
+        # all, and on its own is harmless.
+        return False
+    return all(_PADDING_ECHO_RE.match(s) for s in remaining)
 
 
 def _pytest_path(cmd: str) -> str | None:
@@ -579,22 +619,25 @@ def find_parallel_group_bug(
                         f"pytest scopes overlap: {a!r} and {b!r}",
                     )
 
-    # ── 7. batch of nothing but no-op shell commands ─────────────────────────
-    # A batch where every bash call is a no-op (echo, pwd, ls, true, …) does
-    # no real work. We only flag it when ALL bash calls in the batch are
-    # trivial and there are at least two of them — a lone echo alongside a
-    # real command is fine.
-    bash_cmds = [
+    # ── 7. padding echo alongside real commands ──────────────────────────────
+    # A bare `echo <literal>` (no chaining operator, no $ variable reference,
+    # no command substitution) has no standalone utility: its output only means
+    # something when it feeds into the next command via &&, |, ;, etc. In a
+    # parallel batch each call runs independently, so a padding echo is pure
+    # noise. The legitimate standalone echo forms — `echo $VAR` to inspect an
+    # env var, or `echo text && cmd` chained into real work — are NOT matched.
+    # `ls`, `pwd`, and other inspection commands are never flagged here.
+    padding_echoes = [
         (args.get("command", "") if args else "")
         for name, args in zip(names, parsed_args)
         if name in TERMINAL_TOOL_NAMES
+        and isinstance((args or {}).get("command"), str)
+        and _is_padding_echo((args or {}).get("command", ""))
     ]
-    if len(bash_cmds) >= 2 and all(
-        isinstance(c, str) and _TRIVIAL_SHELL_RE.match(c) for c in bash_cmds
-    ):
+    if padding_echoes:
         return (
-            "no_op_bash_only",
-            f"all {len(bash_cmds)} bash calls in batch are no-op commands",
+            "padding_echo",
+            f"bare echo with no chaining or variable reference: {padding_echoes!r}",
         )
 
     # ── 8. batch ceiling (last-resort circuit breaker) ───────────────────────
