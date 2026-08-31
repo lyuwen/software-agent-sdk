@@ -397,11 +397,18 @@ def is_valid_think_call(arguments: Any) -> bool:
 _WRITE_OPS = frozenset({"str_replace", "create", "insert", "undo_edit"})
 # file_editor sub-commands that only read.
 _READ_OPS = frozenset({"view"})
-# Default batch-size ceiling (overridable via env).
-_DEFAULT_MAX_BATCH = 16
-# Matches the first path-like token after `pytest` in a shell command.
+# Default batch-size ceiling (overridable via env). Set high enough not to
+# reject legitimate fan-out over many distinct files.
+_DEFAULT_MAX_BATCH = 24
+# Metadata keys that do not affect execution, excluded from duplicate fingerprint.
+_NON_EXECUTION_KEYS = frozenset({"summary", "security_risk"})
+# Fraction of the shorter view range that must be shared before two views of
+# the same file are considered redundant (50% overlap threshold).
+_VIEW_OVERLAP_THRESHOLD = 0.5
+# Matches the first path-like token after `pytest` in a shell command,
+# handling flags before the path (e.g. `pytest -q tests/foo.py`).
 _PYTEST_PATH_RE = re.compile(
-    r"pytest\s+([\w./][^\s]*)",
+    r"pytest(?:\s+-\S+)*\s+([\w./][^\s]*)",
     re.IGNORECASE,
 )
 # A bash command in a parallel batch is "no-op" when, after stripping the
@@ -420,7 +427,12 @@ _PYTEST_PATH_RE = re.compile(
 # no-op; `cd /x && pytest` is not (pytest is real work). A `|` pipe means the
 # stdout is consumed downstream, so the command is never no-op. `ls`, `pwd`,
 # and other inspection commands are real work and are never stripped.
-_PADDING_ECHO_RE = re.compile(r"^\s*echo\b[^\n&|;`$]*$", re.IGNORECASE)
+# A bare `echo` that writes to a file is durable, so redirection characters
+# (`>`, `<`) must be excluded alongside pipes and chaining operators. Without
+# that exclusion, `echo ready > status.txt` looks like a no-op literal echo.
+_PADDING_ECHO_RE = re.compile(
+    r"^\s*echo\b[^\n&|;`$<>]*$", re.IGNORECASE
+)
 _PREFIX_ACTION_RE = re.compile(
     r"^\s*(cd|export|pushd|popd|source|\.)\b[^\n&|;`$]*$", re.IGNORECASE
 )
@@ -456,10 +468,13 @@ def _pytest_path(cmd: str) -> str | None:
 
 
 def _ranges_overlap(a: Any, b: Any) -> bool:
-    """Whether two file_editor ``view_range`` values cover any common line.
+    """Whether two view_range values share more than _VIEW_OVERLAP_THRESHOLD
+    of the shorter range's length.
 
-    A missing/None range means "whole file", which overlaps everything. A
-    range is ``[start, end]`` where ``end == -1`` means end-of-file.
+    A missing/None range means "whole file", which always overlaps everything.
+    end == -1 means end-of-file. Two views are only flagged as redundant when
+    the overlapping portion exceeds 50% of the shorter range — reads of [1,100]
+    and [90,200] are independently useful because each returns unique content.
     """
     if not isinstance(a, list) or len(a) != 2:
         return True  # whole file
@@ -471,7 +486,20 @@ def _ranges_overlap(a: Any, b: Any) -> bool:
         return True  # can't reason about it: treat as overlapping
     a_end = float("inf") if a1 == -1 else a1
     b_end = float("inf") if b1 == -1 else b1
-    return a0 <= b_end and b0 <= a_end
+    overlap_start = max(a0, b0)
+    overlap_end = min(a_end, b_end)
+    if overlap_end < overlap_start:
+        return False  # disjoint
+    if overlap_start == float("inf") or overlap_end == float("inf"):
+        # Both extend to EOF — overlap fraction is 100%
+        return True
+    overlap_len = overlap_end - overlap_start + 1
+    a_len = (a_end - a0 + 1) if a_end != float("inf") else float("inf")
+    b_len = (b_end - b0 + 1) if b_end != float("inf") else float("inf")
+    shorter = min(a_len, b_len)
+    if shorter == float("inf") or shorter <= 0:
+        return True
+    return (overlap_len / shorter) >= _VIEW_OVERLAP_THRESHOLD
 
 
 def find_parallel_group_bug(
@@ -487,25 +515,38 @@ def find_parallel_group_bug(
     if not tool_calls or len(tool_calls) < 2:
         return None
 
-    # Unpack names and args once.
+    # Unpack names and parsed args once.
     names: list[str] = []
-    raw_args: list[str] = []
     parsed_args: list[dict[str, Any] | None] = []
     for call in tool_calls:
         fn = call.get("function") if isinstance(call, dict) else None
         name = fn.get("name") if isinstance(fn, dict) else None
         names.append(name if isinstance(name, str) else "")
         arguments = fn.get("arguments") if isinstance(fn, dict) else None
-        raw = arguments if isinstance(arguments, str) else ""
-        raw_args.append(raw)
         parsed_args.append(_coerce_arguments(arguments))
 
-    # ── 1. exact duplicate ───────────────────────────────────────────────────
+    # ── 1. exact duplicate (semantic fingerprint) ──────────────────────────
+    # Fingerprint on parsed args with sorted keys, excluding metadata that
+    # does not affect execution (summary, security_risk). This catches
+    # semantically identical calls even when JSON key order or whitespace
+    # differs, or when only the summary field changed.
     seen: set[tuple[str, str]] = set()
-    for name, raw in zip(names, raw_args):
-        key = (name, raw)
+    for name, args in zip(names, parsed_args):
+        if args is not None:
+            canonical = {
+                k: v for k, v in sorted(args.items())
+                if k not in _NON_EXECUTION_KEYS
+            }
+            fp = json.dumps(canonical, sort_keys=True)
+        else:
+            fp = ""
+        key = (name, fp)
         if key in seen:
-            return ("exact_duplicate", f"{name!r} issued more than once with identical arguments")
+            return (
+                "exact_duplicate",
+                f"{name!r} issued more than once"
+                " with identical arguments",
+            )
         seen.add(key)
 
     # ── 2. finish must be alone ──────────────────────────────────────────────
@@ -550,7 +591,7 @@ def find_parallel_group_bug(
         write_locations[(path, loc)] += 1
 
     conflict = next(
-        ((p, l) for (p, l), n in write_locations.items() if n > 1), None
+        (loc_key for loc_key, n in write_locations.items() if n > 1), None
     )
     if conflict is not None:
         path, loc = conflict
@@ -638,7 +679,9 @@ def find_parallel_group_bug(
 
     # ── 8. batch ceiling (last-resort circuit breaker) ───────────────────────
     try:
-        max_batch = int(os.environ.get("OH_MAX_TOOLCALL_BATCH_SIZE", _DEFAULT_MAX_BATCH))
+        max_batch = int(
+            os.environ.get("OH_MAX_TOOLCALL_BATCH_SIZE", _DEFAULT_MAX_BATCH)
+        )
     except (ValueError, TypeError):
         max_batch = _DEFAULT_MAX_BATCH
     if len(tool_calls) > max_batch:
