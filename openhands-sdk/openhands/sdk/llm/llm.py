@@ -37,9 +37,7 @@ from typing import cast
 
 from litellm import (
     ChatCompletionToolParam,
-    CustomStreamWrapper,
     ResponseInputParam,
-    completion as litellm_completion,
 )
 from litellm.exceptions import (
     APIConnectionError,
@@ -73,11 +71,11 @@ from openhands.sdk.llm.options.responses_options import select_responses_options
 from openhands.sdk.llm.streaming import (
     TokenCallbackType,
 )
+from openhands.sdk.llm.utils.llm_completion import validated_litellm_completion
 from openhands.sdk.llm.utils.metrics import Metrics, MetricsSnapshot
 from openhands.sdk.llm.utils.model_features import get_default_temperature, get_features
 from openhands.sdk.llm.utils.retry_mixin import RetryMixin
 from openhands.sdk.llm.utils.telemetry import Telemetry
-from openhands.sdk.llm.utils.tool_call_validation import find_invalid_tool_call
 from openhands.sdk.logger import ENV_LOG_DIR, get_logger
 
 
@@ -795,222 +793,25 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     ) -> ModelResponse:
         # litellm.modify_params is GLOBAL; guard it for thread-safety
         with self._litellm_modify_params_ctx(self.modify_params):
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore", category=DeprecationWarning, module="httpx.*"
-                )
-                warnings.filterwarnings(
-                    "ignore",
-                    message=r".*content=.*upload.*",
-                    category=DeprecationWarning,
-                )
-                warnings.filterwarnings(
-                    "ignore",
-                    message=r"There is no current event loop",
-                    category=DeprecationWarning,
-                )
-                warnings.filterwarnings(
-                    "ignore",
-                    category=UserWarning,
-                )
-                warnings.filterwarnings(
-                    "ignore",
-                    category=DeprecationWarning,
-                    message="Accessing the 'model_fields' attribute.*",
-                )
-                # Extract api_key value with type assertion for type checker
-                api_key_value: str | None = None
-                if self.api_key:
-                    assert isinstance(self.api_key, SecretStr)
-                    api_key_value = self.api_key.get_secret_value()
+            api_key_value: str | None = None
+            if self.api_key:
+                assert isinstance(self.api_key, SecretStr)
+                api_key_value = self.api_key.get_secret_value()
 
-                # Some providers need renames handled in _normalize_call_kwargs.
-                ret = litellm_completion(
-                    model=self.model,
-                    api_key=api_key_value,
-                    api_base=self.base_url,
-                    api_version=self.api_version,
-                    timeout=self.timeout,
-                    drop_params=self.drop_params,
-                    seed=self.seed,
-                    messages=messages,
-                    **kwargs,
-                )
-                if enable_streaming and on_token is not None:
-                    assert isinstance(ret, CustomStreamWrapper)
-                    chunks = []
-                    for chunk in ret:
-                        on_token(chunk)
-                        chunks.append(chunk)
-                    ret = litellm.stream_chunk_builder(chunks, messages=messages)
-
-                assert isinstance(ret, ModelResponse), (
-                    f"Expected ModelResponse, got {type(ret)}"
-                )
-
-                # Check for malformed tool calls based on OH_MALFORM_PATTERNS
-                if self._check_malformed_response(ret):
-                    logger.warning(
-                        "Detected malformed tool call in response, retrying..."
-                    )
-                    # Raise an exception to trigger retry logic
-                    raise LLMNoResponseError(
-                        "Malformed tool call detected in response"
-                    )
-
-                # Second guardrail: statically validate tool-call parameters
-                # and parallel-group structural rules.
-                invalid = self._check_invalid_tool_call_params(ret)
-                if invalid is not None:
-                    tag, detail = invalid
-                    logger.warning(
-                        f"Tool call validation failed ({tag}): {detail!r}, retrying..."
-                    )
-                    raise LLMNoResponseError(
-                        f"Tool call validation failed: {tag}"
-                    )
-
-                # Third guardrail: verify every tool call names a tool that
-                # was actually offered to the model.
-                unknown = self._check_unknown_tool_call(
-                    ret, kwargs.get("tools")
-                )
-                if unknown is not None:
-                    logger.warning(
-                        f"Detected tool call to unknown tool '{unknown}', retrying..."
-                    )
-                    raise LLMNoResponseError(
-                        f"Tool call to unknown tool '{unknown}' detected in response"
-                    )
-
-                return ret
-
-    def _check_malformed_response(self, response: ModelResponse) -> bool:
-        """Check if the response contains malformed tool calls based on patterns.
-
-        Args:
-            response: The ModelResponse from litellm_completion
-
-        Returns:
-            True if malformed patterns are detected, False otherwise
-        """
-        # Get patterns from environment variable
-        patterns_env = os.environ.get("OH_MALFORM_PATTERNS", "")
-        if not patterns_env:
-            return False
-
-        # Parse semicolon-delimited patterns
-        patterns = [p.strip() for p in patterns_env.split(";") if p.strip()]
-        if not patterns:
-            return False
-
-        # Convert response to OpenAI chat dict form and serialize to JSON
-        try:
-            response_dict = response.model_dump()
-            response_json = json.dumps(response_dict)
-
-            # Check if any pattern exists in the serialized response
-            for pattern in patterns:
-                if pattern in response_json:
-                    logger.warning(
-                        f"Malformed pattern detected: '{pattern}' found in response"
-                    )
-                    return True
-
-        except Exception as e:
-            logger.warning(f"Error checking for malformed response: {e}")
-            # If we can't check, assume it's fine rather than blocking
-            return False
-
-        return False
-
-    def _check_invalid_tool_call_params(
-        self, response: ModelResponse
-    ) -> tuple[str, str] | None:
-        """Statically validate tool calls in the response against known schemas
-        and parallel-group structural rules.
-
-        Gated by the ``OH_VALIDATE_TOOLCALL_PARAMS`` environment variable
-        (opt-in): when unset or falsy, this check is a no-op. When enabled, it
-        runs three layers (see ``find_invalid_tool_call``):
-
-        1. Generic JSON check: every tool call's arguments must parse to a JSON
-           object.
-        2. Tool-specific schema check for ``file_editor`` / ``terminal`` /
-           ``task_tracker`` / ``finish`` / ``think`` and their legacy aliases.
-        3. Parallel-group structural check: when a turn carries two or more
-           tool calls, checks for ``multi_finish``, ``finish_mixed``,
-           ``same_file_multi_write``, ``read_write_same_file``,
-           ``duplicate_bash``, and ``trivial_flood``.
-
-        Args:
-            response: The ModelResponse from litellm_completion
-
-        Returns:
-            A ``(tag, detail)`` tuple for the first violation found, or ``None``
-            if the check is disabled or all calls are legal.  For per-call
-            failures ``tag`` is the tool name and ``detail`` is the raw
-            arguments string; for parallel-group failures ``tag`` is the bug
-            class name and ``detail`` is a short evidence string.
-        """
-        flag = os.environ.get("OH_VALIDATE_TOOLCALL_PARAMS", "")
-        if flag.strip().lower() not in ("1", "true", "yes", "on"):
-            return None
-
-        try:
-            response_dict = response.model_dump()
-            return find_invalid_tool_call(response_dict)
-        except Exception as e:
-            logger.warning(f"Error validating tool call parameters: {e}")
-            # If we can't check, assume it's fine rather than blocking.
-            return None
-
-    def _check_unknown_tool_call(
-        self,
-        response: ModelResponse,
-        tools: list[ChatCompletionToolParam] | None,
-    ) -> str | None:
-        """Check if any tool call in the response names a tool not in the offered list.
-
-        Gated by the ``OH_VALIDATE_TOOLCALL_PARAMS`` environment variable (same
-        opt-in as parameter validation). When no tools were offered, or the env
-        var is not set, the check is a no-op.
-
-        Args:
-            response: The ModelResponse from litellm_completion.
-            tools: The list of ChatCompletionToolParam offered to the model.
-
-        Returns:
-            The name of the first unknown tool found, or ``None`` if all tool
-            calls name known tools (or the check is disabled / not applicable).
-        """
-        flag = os.environ.get("OH_VALIDATE_TOOLCALL_PARAMS", "")
-        if flag.strip().lower() not in ("1", "true", "yes", "on"):
-            return None
-
-        if not tools:
-            return None
-
-        known_names = {
-            t["function"]["name"]
-            for t in tools
-            if t.get("type") == "function" and isinstance(t.get("function"), dict)
-        }
-
-        try:
-            for choice in response.get("choices") or []:
-                message = choice.get("message") or {}
-                tool_calls = message.get("tool_calls") or []
-                for tc in tool_calls:
-                    fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
-                    name = fn.get("name") if isinstance(fn, dict) else None
-                    if name and name not in known_names:
-                        return name
-        except Exception as e:
-            logger.warning(f"Error checking unknown tool call: {e}")
-            return None
-
-        return None
+            return validated_litellm_completion(
+                model=self.model,
+                api_key=api_key_value,
+                api_base=self.base_url,
+                api_version=self.api_version,
+                timeout=self.timeout,
+                drop_params=self.drop_params,
+                seed=self.seed,
+                messages=messages,
+                enable_streaming=enable_streaming,
+                on_token=on_token,
+                tools=kwargs.get("tools"),
+                **kwargs,
+            )
 
     @contextmanager
     def _litellm_modify_params_ctx(self, flag: bool):

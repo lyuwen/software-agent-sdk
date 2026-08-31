@@ -43,6 +43,16 @@ class FunctionCallNotExistsError(LLMError):
         super().__init__(message)
 
 
+# Response structural validation (malformed patterns, bad tool-call params,
+# unknown tools, parallel-group bugs). Distinct from LLMNoResponseError so
+# callers can retry structural failures independently of provider errors.
+class LLMResponseValidationError(LLMError):
+    def __init__(self, tag: str, detail: str) -> None:
+        self.tag = tag
+        self.detail = detail
+        super().__init__(f"[{tag}] {detail}")
+
+
 # Provider/transport related
 class LLMNoResponseError(LLMError):
     def __init__(
