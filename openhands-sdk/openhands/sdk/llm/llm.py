@@ -859,18 +859,15 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     )
 
                 # Second guardrail: statically validate tool-call parameters
-                # against the known tool schemas (file_editor / terminal).
+                # and parallel-group structural rules.
                 invalid = self._check_invalid_tool_call_params(ret)
                 if invalid is not None:
-                    tool_name, raw_args = invalid
+                    tag, detail = invalid
                     logger.warning(
-                        "Detected invalid tool call parameters for "
-                        f"'{tool_name}', retrying... arguments={raw_args!r}"
+                        f"Tool call validation failed ({tag}): {detail!r}, retrying..."
                     )
-                    # Raise the same exception as the malformed check so the
-                    # outer retry logic re-issues the inference request.
                     raise LLMNoResponseError(
-                        f"Invalid tool call parameters detected for '{tool_name}'"
+                        f"Tool call validation failed: {tag}"
                     )
 
                 # Third guardrail: verify every tool call names a tool that
@@ -930,21 +927,31 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     def _check_invalid_tool_call_params(
         self, response: ModelResponse
     ) -> tuple[str, str] | None:
-        """Statically validate tool-call parameters against tool schemas.
+        """Statically validate tool calls in the response against known schemas
+        and parallel-group structural rules.
 
         Gated by the ``OH_VALIDATE_TOOLCALL_PARAMS`` environment variable
         (opt-in): when unset or falsy, this check is a no-op. When enabled, it
-        parses each ``file_editor``/``terminal`` tool call in the response and
-        checks its parameters against the tool's schema and per-command rules
-        (see ``tool_call_validation``). Tool calls for other tools are skipped.
+        runs three layers (see ``find_invalid_tool_call``):
+
+        1. Generic JSON check: every tool call's arguments must parse to a JSON
+           object.
+        2. Tool-specific schema check for ``file_editor`` / ``terminal`` /
+           ``task_tracker`` / ``finish`` / ``think`` and their legacy aliases.
+        3. Parallel-group structural check: when a turn carries two or more
+           tool calls, checks for ``multi_finish``, ``finish_mixed``,
+           ``same_file_multi_write``, ``read_write_same_file``,
+           ``duplicate_bash``, and ``trivial_flood``.
 
         Args:
             response: The ModelResponse from litellm_completion
 
         Returns:
-            A ``(tool_name, raw_arguments)`` tuple for the first tool call with
-            invalid parameters, or ``None`` if the check is disabled or all
-            checked calls are legal.
+            A ``(tag, detail)`` tuple for the first violation found, or ``None``
+            if the check is disabled or all calls are legal.  For per-call
+            failures ``tag`` is the tool name and ``detail`` is the raw
+            arguments string; for parallel-group failures ``tag`` is the bug
+            class name and ``detail`` is a short evidence string.
         """
         flag = os.environ.get("OH_VALIDATE_TOOLCALL_PARAMS", "")
         if flag.strip().lower() not in ("1", "true", "yes", "on"):
