@@ -798,6 +798,11 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 assert isinstance(self.api_key, SecretStr)
                 api_key_value = self.api_key.get_secret_value()
 
+            # Pop tools out of kwargs so it is passed exactly once (as the
+            # dedicated `tools` parameter, which validated_litellm_completion
+            # both forwards to litellm and uses for unknown-tool validation).
+            tools = kwargs.pop("tools", None)
+
             return validated_litellm_completion(
                 model=self.model,
                 api_key=api_key_value,
@@ -809,7 +814,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 messages=messages,
                 enable_streaming=enable_streaming,
                 on_token=on_token,
-                tools=kwargs.get("tools"),
+                tools=tools,
                 **kwargs,
             )
 

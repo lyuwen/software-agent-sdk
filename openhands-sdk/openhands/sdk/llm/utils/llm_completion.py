@@ -224,6 +224,11 @@ def validated_litellm_completion(
                 drop_params=drop_params,
                 seed=seed,
                 messages=messages,
+                # Forward tools explicitly so litellm passes them to the
+                # provider.  tools is kept separate from **kwargs so the
+                # caller (validated_litellm_completion's signature) can
+                # receive it without a duplicate-keyword collision.
+                **({"tools": tools} if tools is not None else {}),
                 **kwargs,
             )
 
