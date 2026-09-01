@@ -250,6 +250,47 @@ def is_valid_terminal_call(arguments: Any) -> bool:
     return True
 
 
+# ── banned shell commands (opt-in via OH_BAN_GIT_REMOTE_OPS) ────────────────
+# Git subcommands that pull remote history into the workspace. Banning them
+# keeps an offline benchmark run hermetic: an agent that re-clones or fetches
+# can resurrect the very commits the task removed.
+_BANNED_GIT_SUBCOMMANDS = ("clone", "fetch", "pull")
+_ENV_BAN_GIT_REMOTE_OPS = "OH_BAN_GIT_REMOTE_OPS"
+
+# Anchor on a shell command boundary (start, or after ; | & ( ` or newline) so
+# that "echo git clone" is not flagged, and tolerate git's global options so
+# that "git -C /repo clone ..." is still caught.
+_BANNED_GIT_RE = re.compile(
+    r"(?:^|[;|&(`\n])\s*git\s+"
+    r"(?:(?:-c\s+\S+|-C\s+\S+|--git-dir=\S+|--work-tree=\S+|--no-pager|-P|--bare)\s+)*"
+    r"(" + "|".join(_BANNED_GIT_SUBCOMMANDS) + r")\b"
+)
+
+
+def _ban_git_remote_ops_enabled() -> bool:
+    """True when OH_BAN_GIT_REMOTE_OPS is set to a truthy value."""
+    flag = os.environ.get(_ENV_BAN_GIT_REMOTE_OPS, "")
+    return flag.strip().lower() in ("1", "true", "yes", "on")
+
+
+def find_banned_command(name: str, arguments: Any) -> str | None:
+    """Return the offending ``git`` subcommand for a banned terminal call.
+
+    Returns ``None`` when the ban is disabled, the call is not a terminal call,
+    or the command is clean. Enabled by :data:`_ENV_BAN_GIT_REMOTE_OPS`.
+    """
+    if name not in TERMINAL_TOOL_NAMES or not _ban_git_remote_ops_enabled():
+        return None
+    args = _coerce_arguments(arguments)
+    if args is None:
+        return None
+    command = args.get("command")
+    if not isinstance(command, str):
+        return None
+    match = _BANNED_GIT_RE.search(command)
+    return f"git {match.group(1)}" if match else None
+
+
 def is_valid_task_tracker_call(arguments: Any) -> bool:
     """Statically validate the parameters of a ``task_tracker`` tool call.
 
@@ -738,6 +779,9 @@ def find_invalid_tool_call(response_dict: dict[str, Any]) -> tuple[str, str] | N
        (``file_editor`` / ``terminal`` / ``task_tracker`` / ``finish`` /
        ``think`` and their legacy aliases). Tool calls for any other tool clear
        the generic check and are otherwise left alone.
+    2b. An *opt-in* ban on ``git clone`` / ``git fetch`` / ``git pull`` in
+       terminal calls, enabled by setting ``OH_BAN_GIT_REMOTE_OPS`` to a truthy
+       value. Reported under the ``banned_command`` tag. Off by default.
     3. A *parallel-group* structural check applied to every assistant message
        that carries two or more tool calls (after all per-call checks pass).
        Catches ``multi_finish``, ``finish_mixed``, ``same_file_multi_write``,
@@ -785,6 +829,12 @@ def find_invalid_tool_call(response_dict: dict[str, Any]) -> tuple[str, str] | N
             if not checker(arguments):
                 raw = arguments if isinstance(arguments, str) else repr(arguments)
                 return (name, raw)
+
+            # Layer 2b: opt-in ban on git remote operations (clone/fetch/pull).
+            banned = find_banned_command(name, arguments)
+            if banned is not None:
+                raw = arguments if isinstance(arguments, str) else repr(arguments)
+                return ("banned_command", f"{banned}: {raw}")
 
         # Layer 3: parallel-group structural check (only for multi-call turns).
         if len(tool_calls) >= 2:
