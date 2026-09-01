@@ -1,7 +1,10 @@
+import os
 import shlex
 import subprocess
 import sys
 import threading
+from collections.abc import Mapping
+from typing import Final
 
 from openhands.sdk.logger import get_logger
 
@@ -88,3 +91,47 @@ def execute_command(
         "".join(stdout_lines),
         "".join(stderr_lines),
     )
+
+
+# Env vars that should not be exposed to subprocesses (e.g., bash commands
+# executed by the agent). These credentials allow access to user secrets via
+# the SaaS API and must remain isolated to the SDK's Python process.
+_SENSITIVE_ENV_VARS = frozenset({"SESSION_API_KEY"})
+_AI_AGENT_ENV_VAR: Final[str] = "AI_AGENT"
+
+
+def sanitized_env(
+    env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return a copy of *env* with sanitized values.
+
+    PyInstaller-based binaries rewrite ``LD_LIBRARY_PATH`` so their vendored
+    libraries win. This function restores the original value so that subprocess
+    will not use them.
+
+    Sensitive environment variables (e.g., ``SESSION_API_KEY``) are stripped
+    to prevent LLM-driven agents from accessing credentials via terminal
+    commands.
+
+    ``AI_AGENT`` defaults to ``openhands`` so downstream tools can select
+    agent-friendly output without relying on product-specific heuristics.
+    """
+    base_env: dict[str, str]
+    if env is None:
+        base_env = dict(os.environ)
+    else:
+        base_env = dict(env)
+
+    for key in _SENSITIVE_ENV_VARS:
+        base_env.pop(key, None)
+
+    if not base_env.get(_AI_AGENT_ENV_VAR, "").strip():
+        base_env[_AI_AGENT_ENV_VAR] = "openhands"
+
+    if "LD_LIBRARY_PATH_ORIG" in base_env:
+        origin = base_env["LD_LIBRARY_PATH_ORIG"]
+        if origin:
+            base_env["LD_LIBRARY_PATH"] = origin
+        else:
+            base_env.pop("LD_LIBRARY_PATH", None)
+    return base_env

@@ -1,6 +1,7 @@
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -56,6 +57,38 @@ def _camel_to_snake(name: str) -> str:
     s1 = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", name)
     # Insert underscore before uppercase letters that follow lowercase letters
     return re.sub("([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
+
+
+@dataclass(frozen=True, slots=True)
+class DeclaredResources:
+    """Resources a tool accesses for a given action.
+
+    Used by ``ParallelToolExecutor`` to decide what locks (if any) to
+    acquire before running a tool.
+
+    Examples:
+
+        DeclaredResources(keys=(), declared=False)       # unknown → serialize
+        DeclaredResources(keys=(), declared=True)         # safe, no resources
+        DeclaredResources(keys=("file:/a.py",), declared=True)  # lock these
+
+    Note:
+        The distinction between `declared=True` with empty keys and
+        `declared=False` is subtle but important:
+
+        - `declared=True, keys=()`: the tool has explicitly analysed its
+          resource usage and determined it touches nothing shared.  The
+          executor trusts this and skips locking entirely.
+        - `declared=False`: the tool has *not* declared its resources
+          (the default).  The executor cannot assume safety, so it falls
+          back to a tool-wide mutex that serializes all calls to this tool.
+
+        In short: `declared=False` means "I haven't thought about it"
+        while `declared=True, keys=()` means "I have, and I'm safe."
+    """
+
+    keys: tuple[str, ...]
+    declared: bool
 
 
 class ToolAnnotations(BaseModel):

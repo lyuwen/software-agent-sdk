@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from openhands.sdk.tool import ToolExecutor
+from openhands.sdk.utils import sanitized_env
 
 
 if TYPE_CHECKING:
@@ -38,6 +39,14 @@ class GlobExecutor(ToolExecutor[GlobAction, GlobObservation]):
         self._ripgrep_available: bool = _check_ripgrep_available()
         if not self._ripgrep_available:
             _log_ripgrep_fallback_warning("glob", "Python glob module")
+
+    def is_parallel_safe(self) -> bool:
+        """Whether the executor is safe for lock-free parallel execution.
+
+        True when ripgrep is available (independent subprocesses).
+        False for the Python glob fallback (process-global os.chdir()).
+        """
+        return self._ripgrep_available
 
     def __call__(
         self,
@@ -149,7 +158,12 @@ class GlobExecutor(ToolExecutor[GlobAction, GlobObservation]):
 
         # Execute ripgrep
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30, check=False
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=sanitized_env(),
         )
 
         # Parse output into file paths
@@ -157,7 +171,7 @@ class GlobExecutor(ToolExecutor[GlobAction, GlobObservation]):
         if result.stdout:
             for line in result.stdout.strip().split("\n"):
                 if line:
-                    file_paths.append(line)
+                    file_paths.append(str(Path(line).resolve()))
                     # Limit to first 100 files
                     if len(file_paths) >= 100:
                         break
@@ -194,11 +208,10 @@ class GlobExecutor(ToolExecutor[GlobAction, GlobObservation]):
             # Use glob to find matching files
             matches = glob_module.glob(pattern, recursive=True)
 
-            # Convert to absolute paths (without resolving symlinks)
-            # and sort by modification time
+            # Convert to absolute paths without resolving symlinks and sort by
+            # modification time.
             file_paths = []
             for match in matches:
-                # Use absolute() instead of resolve() to avoid resolving symlinks
                 abs_path = str((search_path / match).absolute())
                 if os.path.isfile(abs_path):
                     file_paths.append((abs_path, os.path.getmtime(abs_path)))
@@ -249,13 +262,15 @@ class GlobExecutor(ToolExecutor[GlobAction, GlobObservation]):
         # Expand ~ for user home directory
         pattern = os.path.expanduser(pattern)
 
-        # Check if pattern is an absolute path
-        if not pattern.startswith("/"):
+        path_obj = Path(pattern)
+
+        # Check if pattern is an absolute path. Keep POSIX-style absolute paths
+        # working on Windows too, since agents often emit /tmp-style paths.
+        if not pattern.startswith("/") and not path_obj.is_absolute():
             # Relative pattern - caller should use default working directory
             return None, pattern
 
         # Absolute path pattern - extract the base path
-        path_obj = Path(pattern)
         parts = path_obj.parts
 
         # Find where the glob characters start using glob.has_magic()
@@ -273,6 +288,6 @@ class GlobExecutor(ToolExecutor[GlobAction, GlobObservation]):
             search_path = Path(*search_parts)
             # Get the remaining parts as the pattern
             remaining = parts[len(search_parts) :]
-            adjusted_pattern = str(Path(*remaining)) if remaining else "**/*"
+            adjusted_pattern = "/".join(remaining) if remaining else "**/*"
 
         return search_path.resolve(), adjusted_pattern
