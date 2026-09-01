@@ -140,7 +140,7 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
         if truncated:
             output += (
                 "\n\n[Results truncated to first 100 files. "
-                "Consider using a more specific pattern or narrowing the search path.]"
+                "Consider using a more specific pattern.]"
             )
         return output
 
@@ -150,9 +150,9 @@ class GrepExecutor(ToolExecutor[GrepAction, GrepObservation]):
         search_path: Path,
         include_pattern: str | None,
     ) -> bool:
-        """Check whether a path passes the hidden-file and include filters."""
+        """Return whether a matched path should be surfaced to the user."""
         try:
-            relative_parts = path.relative_to(search_path).parts
+            relative_parts = path.resolve().relative_to(search_path.resolve()).parts
         except ValueError:
             relative_parts = (path.name,)
 
