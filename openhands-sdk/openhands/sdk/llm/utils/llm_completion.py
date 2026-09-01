@@ -11,8 +11,10 @@ litellm completion call with:
 2. Malformed-pattern detection  (``OH_MALFORM_PATTERNS``).
 3. Tool-call parameter + parallel-group validation (``OH_VALIDATE_TOOLCALL_PARAMS``).
 4. Unknown-tool detection (``OH_VALIDATE_TOOLCALL_PARAMS``).
+5. Missing-tool-call detection (``OH_EXPECT_TOOLCALL``, off by default): an
+   assistant reply with no tool call is retried.
 
-All three validation checks raise ``LLMResponseValidationError`` on failure.
+All validation checks raise ``LLMResponseValidationError`` on failure.
 The function retries that specific error up to ``OH_VALIDATION_RETRY`` times
 (default 5).  On the final attempt it still returns the response rather than
 raising, but annotates the first choice's message with the last validation
@@ -41,6 +43,9 @@ logger = get_logger(__name__)
 # Number of times to retry on a validation error (tunable via env).
 _DEFAULT_VALIDATION_RETRIES = 5
 _ENV_VALIDATION_RETRY = "OH_VALIDATION_RETRY"
+
+# Opt-in: treat an assistant reply with no tool call as a retryable failure.
+_ENV_EXPECT_TOOLCALL = "OH_EXPECT_TOOLCALL"
 
 
 def _max_validation_retries() -> int:
@@ -134,18 +139,66 @@ def _check_unknown_tool(
     return None
 
 
+def _check_expect_toolcall(
+    response: ModelResponse,
+    tools: list[ChatCompletionToolParam] | None,
+) -> LLMResponseValidationError | None:
+    """Return an error if OH_EXPECT_TOOLCALL is set and a reply has no tool call.
+
+    Off by default. When enabled, an assistant message that carries no
+    ``tool_calls`` is treated as a validation failure so the completion is
+    retried: in an agent loop every turn is expected to act through a tool
+    (including finishing via ``FinishTool``), so a prose-only reply is a stall.
+
+    Only meaningful when tools were actually offered -- with no tools in the
+    request, a plain message is the only legal reply, so the check is skipped.
+    """
+    flag = os.environ.get(_ENV_EXPECT_TOOLCALL, "")
+    if flag.strip().lower() not in ("1", "true", "yes", "on"):
+        return None
+    if not tools:
+        return None
+    try:
+        response_dict = response.model_dump()
+        for choice in response_dict.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                continue
+            # Only assistant turns are expected to call tools.
+            role = message.get("role")
+            if role is not None and role != "assistant":
+                continue
+            if message.get("tool_calls"):
+                continue
+            content = message.get("content")
+            snippet = content[:200] if isinstance(content, str) else repr(content)
+            logger.warning(
+                "Assistant message carries no tool call while OH_EXPECT_TOOLCALL "
+                "is enabled; retrying"
+            )
+            return LLMResponseValidationError("missing_tool_call", snippet)
+    except Exception as exc:
+        logger.warning(f"Error checking for missing tool call: {exc}")
+    return None
+
+
 def _validate(
     response: ModelResponse,
     tools: list[ChatCompletionToolParam] | None,
 ) -> LLMResponseValidationError | None:
-    """Run all three validation checks and return the first error found."""
+    """Run all validation checks and return the first error found."""
     err = _check_malformed(response)
     if err is not None:
         return err
     err = _check_invalid_params(response)
     if err is not None:
         return err
-    return _check_unknown_tool(response, tools)
+    err = _check_unknown_tool(response, tools)
+    if err is not None:
+        return err
+    return _check_expect_toolcall(response, tools)
 
 
 def _annotate_response(
