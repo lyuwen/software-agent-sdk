@@ -117,14 +117,14 @@ def test_docker_dev_workspace_has_build_fields():
 
 
 def test_docker_workspace_uses_default_memory_limit_when_env_is_unset():
-    """DockerWorkspace should default to 13g when no override is configured."""
+    """DockerWorkspace should default to 14g when no override is configured."""
     from openhands.workspace import DockerWorkspace
 
     with patch.dict(os.environ, {}, clear=True):
         with patch.object(DockerWorkspace, "_start_container"):
             workspace = DockerWorkspace(server_image="test:latest", bind_volumes=[])
 
-    assert workspace.memory_limit == "13g"
+    assert workspace.memory_limit == "14g"
 
 
 def test_docker_workspace_reads_memory_limit_from_environment():
@@ -148,11 +148,22 @@ def test_docker_workspace_passes_memory_limit_to_docker_run():
         Mock(returncode=0, stdout="", stderr=""),
     ]
 
-    with patch("openhands.workspace.docker.workspace.find_available_tcp_port", return_value=34567):
-        with patch("openhands.workspace.docker.workspace.check_port_available", return_value=True):
-            with patch("openhands.workspace.docker.workspace.execute_command", side_effect=execute_results) as mock_exec:
+    with patch(
+        "openhands.workspace.docker.workspace.find_available_tcp_port",
+        return_value=34567,
+    ):
+        with patch(
+            "openhands.workspace.docker.workspace.check_port_available",
+            return_value=True,
+        ):
+            with patch(
+                "openhands.workspace.docker.workspace.execute_command",
+                side_effect=execute_results,
+            ) as mock_exec:
                 with patch.object(DockerWorkspace, "_wait_for_health"):
-                    with patch("openhands.sdk.workspace.remote.RemoteWorkspace.model_post_init"):
+                    with patch(
+                        "openhands.sdk.workspace.remote.RemoteWorkspace.model_post_init"
+                    ):
                         DockerWorkspace(
                             server_image="test:latest",
                             memory_limit="17g",
@@ -170,23 +181,41 @@ def test_flex_workspace_path_excludes_agent_server_venv_bin():
     from openhands.workspace import FlexWorkspace
 
     execute_results = [
-        Mock(returncode=0, stdout="", stderr=""),
-        Mock(returncode=0, stdout="plugin-container\n", stderr=""),
-        Mock(returncode=0, stdout="workspace-container\n", stderr=""),
+        Mock(returncode=0, stdout="", stderr=""),  # docker version
+        Mock(returncode=0, stdout="", stderr=""),  # docker pull (detect glibc)
+        Mock(
+            returncode=0, stdout="", stderr=""
+        ),  # docker run ldd (detect glibc, fails to parse -> None)
+        Mock(
+            returncode=0, stdout="", stderr=""
+        ),  # docker image inspect (get base PATH -> fallback)
+        Mock(returncode=0, stdout="plugin-container\n", stderr=""),  # docker create
+        Mock(returncode=0, stdout="workspace-container\n", stderr=""),  # docker run
     ]
 
-    with patch("openhands.workspace.docker.flex_workspace.find_available_tcp_port", return_value=34567):
-        with patch("openhands.workspace.docker.flex_workspace.check_port_available", return_value=True):
-            with patch("openhands.workspace.docker.flex_workspace.execute_command", side_effect=execute_results) as mock_exec:
+    with patch(
+        "openhands.workspace.docker.flex_workspace.find_available_tcp_port",
+        return_value=34567,
+    ):
+        with patch(
+            "openhands.workspace.docker.flex_workspace.check_port_available",
+            return_value=True,
+        ):
+            with patch(
+                "openhands.workspace.docker.flex_workspace.execute_command",
+                side_effect=execute_results,
+            ) as mock_exec:
                 with patch.object(FlexWorkspace, "_wait_for_health"):
-                    with patch("openhands.sdk.workspace.remote.RemoteWorkspace.model_post_init"):
+                    with patch(
+                        "openhands.sdk.workspace.remote.RemoteWorkspace.model_post_init"
+                    ):
                         FlexWorkspace(
                             base_image="base:latest",
                             detach_logs=False,
                             bind_volumes=[],
                         )
 
-    run_cmd = mock_exec.call_args_list[2].args[0]
+    run_cmd = mock_exec.call_args_list[5].args[0]
     path_arg = next(arg for arg in run_cmd if arg.startswith("PATH="))
     assert "/agent-server/.venv/bin" not in path_arg
     assert "/agent-server/bin" in path_arg
@@ -197,23 +226,41 @@ def test_flex_workspace_still_uses_agent_server_venv_python_entrypoint():
     from openhands.workspace import FlexWorkspace
 
     execute_results = [
-        Mock(returncode=0, stdout="", stderr=""),
-        Mock(returncode=0, stdout="plugin-container\n", stderr=""),
-        Mock(returncode=0, stdout="workspace-container\n", stderr=""),
+        Mock(returncode=0, stdout="", stderr=""),  # docker version
+        Mock(returncode=0, stdout="", stderr=""),  # docker pull (detect glibc)
+        Mock(
+            returncode=0, stdout="", stderr=""
+        ),  # docker run ldd (detect glibc, fails to parse -> None)
+        Mock(
+            returncode=0, stdout="", stderr=""
+        ),  # docker image inspect (get base PATH -> fallback)
+        Mock(returncode=0, stdout="plugin-container\n", stderr=""),  # docker create
+        Mock(returncode=0, stdout="workspace-container\n", stderr=""),  # docker run
     ]
 
-    with patch("openhands.workspace.docker.flex_workspace.find_available_tcp_port", return_value=34567):
-        with patch("openhands.workspace.docker.flex_workspace.check_port_available", return_value=True):
-            with patch("openhands.workspace.docker.flex_workspace.execute_command", side_effect=execute_results) as mock_exec:
+    with patch(
+        "openhands.workspace.docker.flex_workspace.find_available_tcp_port",
+        return_value=34567,
+    ):
+        with patch(
+            "openhands.workspace.docker.flex_workspace.check_port_available",
+            return_value=True,
+        ):
+            with patch(
+                "openhands.workspace.docker.flex_workspace.execute_command",
+                side_effect=execute_results,
+            ) as mock_exec:
                 with patch.object(FlexWorkspace, "_wait_for_health"):
-                    with patch("openhands.sdk.workspace.remote.RemoteWorkspace.model_post_init"):
+                    with patch(
+                        "openhands.sdk.workspace.remote.RemoteWorkspace.model_post_init"
+                    ):
                         FlexWorkspace(
                             base_image="base:latest",
                             detach_logs=False,
                             bind_volumes=[],
                         )
 
-    run_cmd = mock_exec.call_args_list[2].args[0]
+    run_cmd = mock_exec.call_args_list[5].args[0]
     entrypoint_index = run_cmd.index("--entrypoint")
     assert run_cmd[entrypoint_index + 1] == "/agent-server/.venv/bin/python"
 

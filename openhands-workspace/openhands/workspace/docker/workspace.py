@@ -117,7 +117,7 @@ class DockerWorkspace(RemoteWorkspace):
         description="Bind extra directories to container workspace.",
     )
     memory_limit: str = Field(
-        default_factory=lambda: os.getenv("OH_WORKSPACE_MEMORY_LIMIT", "13g"),
+        default_factory=lambda: os.getenv("OH_WORKSPACE_MEMORY_LIMIT", "14g"),
         description="Docker container memory limit.",
     )
 
@@ -152,6 +152,81 @@ class DockerWorkspace(RemoteWorkspace):
         if self.server_image is None:
             raise ValueError("server_image must be set")
         return self.server_image
+
+    def _build_run_args(
+        self,
+        image: str,
+        *,
+        extra_flags: list[str] | None = None,
+        entrypoint: list[str] | None = None,
+        command: list[str] | None = None,
+        container_name: str,
+    ) -> list[str]:
+        """Build the full `docker run` argv for this workspace.
+
+        Shared by DockerWorkspace and FlexWorkspace so there is exactly one
+        place where run arguments -- and therefore network enforcement -- are
+        constructed. Always returns an argv list; never a shell string.
+        """
+        flags: list[str] = list(extra_flags or [])
+
+        for key in self.forward_env:
+            if key in os.environ:
+                flags += ["-e", f"{key}={os.environ[key]}"]
+        for key, val in os.environ.items():
+            if key.startswith("OH_") and key not in self.forward_env:
+                flags += ["-e", f"{key}={val}"]
+
+        if self.mount_dir:
+            flags += ["-v", f"{self.mount_dir}:/workspace"]
+            logger.info(
+                f"Mounting host dir {self.mount_dir} to container path /workspace"
+            )
+        for volume in self.bind_volumes:
+            flags += ["-v", volume]
+
+        if self.memory_limit:
+            flags += ["--memory", self.memory_limit]
+
+        flags += self._build_port_args()
+
+        if self.enable_gpu:
+            flags += ["--gpus", "all"]
+
+        run_cmd = [
+            "docker",
+            "run",
+            "-d",
+            "--platform",
+            self.platform,
+            "--rm",
+            "--name",
+            container_name,
+            *flags,
+        ]
+        if entrypoint:
+            run_cmd += ["--entrypoint", *entrypoint]
+        run_cmd.append(image)
+        if command:
+            run_cmd += command
+        return run_cmd
+
+    def _build_port_args(self) -> list[str]:
+        """Publish the agent-server port (and optional VSCode/VNC ports).
+
+        Overridden when a sidecar owns the namespace: in that case the sidecar
+        publishes the ports and the workspace must publish none.
+        """
+        ports = ["-p", f"{self.host_port}:8000"]
+        if self.extra_ports and self.host_port is not None:
+            host_port = self.host_port
+            ports += [
+                "-p",
+                f"{host_port + 1}:8001",  # VSCode
+                "-p",
+                f"{host_port + 2}:8002",  # Desktop VNC
+            ]
+        return ports
 
     def _start_container(self, image: str, context: Any) -> None:
         """Start the Docker container with the given image.
@@ -194,65 +269,11 @@ class DockerWorkspace(RemoteWorkspace):
                 "Docker Desktop/daemon."
             )
 
-        # Prepare Docker run flags
-        flags: list[str] = []
-        for key in self.forward_env:
-            if key in os.environ:
-                flags += ["-e", f"{key}={os.environ[key]}"]
-
-        # Forward environment variables with OH_ prefix
-        for key, val in os.environ.items():
-            if key.startswith("OH_") and key not in self.forward_env:
-                flags += ["-e", f"{key}={val}"]
-
-        if self.mount_dir:
-            mount_path = "/workspace"
-            flags += ["-v", f"{self.mount_dir}:{mount_path}"]
-            logger.info(
-                f"Mounting host dir {self.mount_dir} to container path {mount_path}"
-            )
-
-        if self.bind_volumes:
-            for volume in self.bind_volumes:
-                flags += ["-v", volume]
-
-        if self.memory_limit:
-            flags += ["--memory", self.memory_limit]
-
-        ports = ["-p", f"{self.host_port}:8000"]
-        if self.extra_ports:
-            ports += [
-                "-p",
-                f"{self.host_port + 1}:8001",  # VSCode
-                "-p",
-                f"{self.host_port + 2}:8002",  # Desktop VNC
-            ]
-        flags += ports
-
-        # Add GPU support if enabled
-        if self.enable_gpu:
-            flags += ["--gpus", "all"]
-
-        # Set memory limit per instance
-        flags += ["--memory=14g"]
-
-        # Run container
-        run_cmd = [
-            "docker",
-            "run",
-            "-d",
-            "--platform",
-            self.platform,
-            "--rm",
-            "--name",
-            f"agent-server-{uuid.uuid4()}",
-            *flags,
+        run_cmd = self._build_run_args(
             image,
-            "--host",
-            "0.0.0.0",
-            "--port",
-            "8000",
-        ]
+            container_name=f"agent-server-{uuid.uuid4()}",
+            command=["--host", "0.0.0.0", "--port", "8000"],
+        )
         proc = execute_command(run_cmd)
         if proc.returncode != 0:
             raise RuntimeError(f"Failed to run docker container: {proc.stderr}")

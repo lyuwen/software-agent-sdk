@@ -1,6 +1,5 @@
 """Flex workspace using the agent-plugin volume mount pattern."""
 
-import os
 import re
 import threading
 import uuid
@@ -43,23 +42,32 @@ def _detect_glibc_version(image: str, platform: str = "linux/amd64") -> float | 
     if pull_proc.returncode != 0:
         logger.warning(
             "docker pull failed for %s (exit %d): %s",
-            image, pull_proc.returncode, pull_proc.stderr,
+            image,
+            pull_proc.returncode,
+            pull_proc.stderr,
         )
 
     proc = execute_command(
         [
-            "docker", "run", "--rm",
-            "--platform", platform,
-            "--entrypoint", "",
+            "docker",
+            "run",
+            "--rm",
+            "--platform",
+            platform,
+            "--entrypoint",
+            "",
             image,
-            "ldd", "--version",
+            "ldd",
+            "--version",
         ],
         timeout=30,
     )
     if proc.returncode != 0:
         logger.warning(
             "glibc detection failed for %s (exit %d): %s",
-            image, proc.returncode, proc.stderr,
+            image,
+            proc.returncode,
+            proc.stderr,
         )
         return None
 
@@ -99,8 +107,11 @@ def _get_base_image_path(image: str) -> str:
     """
     proc = execute_command(
         [
-            "docker", "image", "inspect",
-            "--format", '{{range .Config.Env}}{{println .}}{{end}}',
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            "{{range .Config.Env}}{{println .}}{{end}}",
             image,
         ],
         timeout=15,
@@ -200,7 +211,8 @@ class FlexWorkspace(DockerWorkspace):
             fallback_lib = "/agent-server/lib"
             logger.info(
                 "Using glibc variant '%s' (glibc %.2f) for bin/lib paths",
-                variant, glibc_ver,
+                variant,
+                glibc_ver,
             )
         else:
             bin_path = "/agent-server/bin"
@@ -239,81 +251,31 @@ class FlexWorkspace(DockerWorkspace):
             )
         logger.info(f"Created plugin data container: {self._plugin_container_name}")
 
-        # Prepare Docker run flags
-        flags: list[str] = []
-
-        # Agent-plugin volume
-        flags += ["--volumes-from", self._plugin_container_name]
-
-        # Agent-server environment variables
-        flags += [
-            "-e", f"PATH={combined_path}",
-            "-e", f"LD_LIBRARY_PATH={combined_lib}",
-            "-e", "UV_PYTHON_INSTALL_DIR=/agent-server/uv-managed-python",
-        ]
-
-        # Forward environment variables
-        for key in self.forward_env:
-            if key in os.environ:
-                flags += ["-e", f"{key}={os.environ[key]}"]
-
-        # Forward environment variables with OH_ prefix
-        for key, val in os.environ.items():
-            if key.startswith("OH_") and key not in self.forward_env:
-                flags += ["-e", f"{key}={val}"]
-
-        if self.mount_dir:
-            mount_path = "/workspace"
-            flags += ["-v", f"{self.mount_dir}:{mount_path}"]
-            logger.info(
-                f"Mounting host dir {self.mount_dir} to container path {mount_path}"
-            )
-
-        if self.bind_volumes:
-            for volume in self.bind_volumes:
-                flags += ["-v", volume]
-
-        ports = ["-p", f"{self.host_port}:8000"]
-        if self.extra_ports:
-            ports += [
-                "-p",
-                f"{self.host_port + 1}:8001",  # VSCode
-                "-p",
-                f"{self.host_port + 2}:8002",  # Desktop VNC
-            ]
-        flags += ports
-
-        # Set working directory to / so the agent server uses absolute paths
-        flags += ["-w", "/"]
-
-        # Add GPU support if enabled
-        if self.enable_gpu:
-            flags += ["--gpus", "all"]
-
-        # Set memory limit per instance
-        flags += ["--memory=14g"]
-
-        # Run container with entrypoint override for agent server
-        run_cmd = [
-            "docker",
-            "run",
-            "-d",
-            "--platform",
-            self.platform,
-            "--rm",
-            "--name",
-            f"agent-server-{uuid.uuid4()}",
-            *flags,
-            "--entrypoint",
-            "/agent-server/.venv/bin/python",
+        run_cmd = self._build_run_args(
             image,
-            "-m",
-            "openhands.agent_server",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            "8000",
-        ]
+            container_name=f"agent-server-{uuid.uuid4()}",
+            extra_flags=[
+                "--volumes-from",
+                self._plugin_container_name,
+                "-e",
+                f"PATH={combined_path}",
+                "-e",
+                f"LD_LIBRARY_PATH={combined_lib}",
+                "-e",
+                "UV_PYTHON_INSTALL_DIR=/agent-server/uv-managed-python",
+                "-w",
+                "/",
+            ],
+            entrypoint=["/agent-server/.venv/bin/python"],
+            command=[
+                "-m",
+                "openhands.agent_server",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "8000",
+            ],
+        )
         proc = execute_command(run_cmd)
         if proc.returncode != 0:
             raise RuntimeError(f"Failed to run docker container: {proc.stderr}")
