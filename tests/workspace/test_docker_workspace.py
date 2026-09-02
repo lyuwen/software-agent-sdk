@@ -176,46 +176,64 @@ def test_docker_workspace_passes_memory_limit_to_docker_run():
     assert "17g" in run_cmd
 
 
-def test_flex_workspace_path_excludes_agent_server_venv_bin():
-    """FlexWorkspace should not expose the agent server venv on PATH."""
+def _flex_docker_run_argv():
+    """Launch a FlexWorkspace with docker faked; return its `docker run` argv.
+
+    Container startup lives in DockerWorkspace while the plugin/glibc calls
+    live in FlexWorkspace, so both modules are stubbed and the run command is
+    matched by content rather than by call index.
+    """
     from openhands.workspace import FlexWorkspace
 
-    execute_results = [
-        Mock(returncode=0, stdout="", stderr=""),  # docker version
-        Mock(returncode=0, stdout="", stderr=""),  # docker pull (detect glibc)
-        Mock(
-            returncode=0, stdout="", stderr=""
-        ),  # docker run ldd (detect glibc, fails to parse -> None)
-        Mock(
-            returncode=0, stdout="", stderr=""
-        ),  # docker image inspect (get base PATH -> fallback)
-        Mock(returncode=0, stdout="plugin-container\n", stderr=""),  # docker create
-        Mock(returncode=0, stdout="workspace-container\n", stderr=""),  # docker run
-    ]
+    def fake_exec(cmd, *args, **kwargs):
+        if "create" in cmd:
+            return Mock(returncode=0, stdout="plugin-container\n", stderr="")
+        if cmd[:2] == ["docker", "run"] and "-d" in cmd:
+            return Mock(returncode=0, stdout="workspace-container\n", stderr="")
+        # docker version / pull / run ldd (glibc unparseable -> None) /
+        # image inspect (base PATH -> fallback)
+        return Mock(returncode=0, stdout="", stderr="")
 
-    with patch(
-        "openhands.workspace.docker.flex_workspace.find_available_tcp_port",
-        return_value=34567,
-    ):
-        with patch(
-            "openhands.workspace.docker.flex_workspace.check_port_available",
+    with (
+        patch(
+            "openhands.workspace.docker.workspace.find_available_tcp_port",
+            return_value=34567,
+        ),
+        patch(
+            "openhands.workspace.docker.workspace.check_port_available",
             return_value=True,
-        ):
-            with patch(
-                "openhands.workspace.docker.flex_workspace.execute_command",
-                side_effect=execute_results,
-            ) as mock_exec:
-                with patch.object(FlexWorkspace, "_wait_for_health"):
-                    with patch(
-                        "openhands.sdk.workspace.remote.RemoteWorkspace.model_post_init"
-                    ):
-                        FlexWorkspace(
-                            base_image="base:latest",
-                            detach_logs=False,
-                            bind_volumes=[],
-                        )
+        ),
+        patch(
+            "openhands.workspace.docker.workspace.execute_command",
+            side_effect=fake_exec,
+        ) as main_exec,
+        patch(
+            "openhands.workspace.docker.flex_workspace.execute_command",
+            side_effect=fake_exec,
+        ) as flex_exec,
+        patch.object(FlexWorkspace, "_wait_for_health"),
+        patch("openhands.sdk.workspace.remote.RemoteWorkspace.model_post_init"),
+    ):
+        ws = FlexWorkspace(
+            base_image="base:latest",
+            detach_logs=False,
+            bind_volumes=[],
+        )
+        ws._container_id = None  # keep __del__ from issuing a real docker stop
+        ws._plugin_container_name = None
+        runs = [
+            c.args[0]
+            for mock in (main_exec, flex_exec)
+            for c in mock.call_args_list
+            if c.args[0][:2] == ["docker", "run"] and "-d" in c.args[0]
+        ]
+    assert len(runs) == 1, f"expected exactly one docker run, saw {len(runs)}"
+    return runs[0]
 
-    run_cmd = mock_exec.call_args_list[5].args[0]
+
+def test_flex_workspace_path_excludes_agent_server_venv_bin():
+    """FlexWorkspace should not expose the agent server venv on PATH."""
+    run_cmd = _flex_docker_run_argv()
     path_arg = next(arg for arg in run_cmd if arg.startswith("PATH="))
     assert "/agent-server/.venv/bin" not in path_arg
     assert "/agent-server/bin" in path_arg
@@ -223,44 +241,7 @@ def test_flex_workspace_path_excludes_agent_server_venv_bin():
 
 def test_flex_workspace_still_uses_agent_server_venv_python_entrypoint():
     """FlexWorkspace should keep launching the server with its venv python."""
-    from openhands.workspace import FlexWorkspace
-
-    execute_results = [
-        Mock(returncode=0, stdout="", stderr=""),  # docker version
-        Mock(returncode=0, stdout="", stderr=""),  # docker pull (detect glibc)
-        Mock(
-            returncode=0, stdout="", stderr=""
-        ),  # docker run ldd (detect glibc, fails to parse -> None)
-        Mock(
-            returncode=0, stdout="", stderr=""
-        ),  # docker image inspect (get base PATH -> fallback)
-        Mock(returncode=0, stdout="plugin-container\n", stderr=""),  # docker create
-        Mock(returncode=0, stdout="workspace-container\n", stderr=""),  # docker run
-    ]
-
-    with patch(
-        "openhands.workspace.docker.flex_workspace.find_available_tcp_port",
-        return_value=34567,
-    ):
-        with patch(
-            "openhands.workspace.docker.flex_workspace.check_port_available",
-            return_value=True,
-        ):
-            with patch(
-                "openhands.workspace.docker.flex_workspace.execute_command",
-                side_effect=execute_results,
-            ) as mock_exec:
-                with patch.object(FlexWorkspace, "_wait_for_health"):
-                    with patch(
-                        "openhands.sdk.workspace.remote.RemoteWorkspace.model_post_init"
-                    ):
-                        FlexWorkspace(
-                            base_image="base:latest",
-                            detach_logs=False,
-                            bind_volumes=[],
-                        )
-
-    run_cmd = mock_exec.call_args_list[5].args[0]
+    run_cmd = _flex_docker_run_argv()
     entrypoint_index = run_cmd.index("--entrypoint")
     assert run_cmd[entrypoint_index + 1] == "/agent-server/.venv/bin/python"
 
