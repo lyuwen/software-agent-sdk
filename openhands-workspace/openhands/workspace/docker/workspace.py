@@ -15,6 +15,9 @@ from openhands.sdk.logger import get_logger
 from openhands.sdk.utils.command import execute_command
 from openhands.sdk.workspace import PlatformType, RemoteWorkspace
 
+from .egress_runtime import EgressRuntime, start_egress_sidecar
+from .network_policy import WorkspaceNetworkPolicy, policy_from_env
+
 
 logger = get_logger(__name__)
 
@@ -121,10 +124,20 @@ class DockerWorkspace(RemoteWorkspace):
         description="Docker container memory limit.",
     )
 
+    network_policy: WorkspaceNetworkPolicy = Field(
+        default_factory=policy_from_env,
+        description=(
+            "Egress policy. Defaults from OH_NETWORK_MODE; 'public' preserves "
+            "unrestricted networking. Non-public modes start an nftables "
+            "sidecar that owns the network namespace."
+        ),
+    )
+
     _container_id: str | None = PrivateAttr(default=None)
     _image_name: str | None = PrivateAttr(default=None)
     _logs_thread: threading.Thread | None = PrivateAttr(default=None)
     _stop_logs: threading.Event = PrivateAttr(default_factory=threading.Event)
+    _egress: EgressRuntime | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _validate_server_image(self):
@@ -193,6 +206,18 @@ class DockerWorkspace(RemoteWorkspace):
         if self.enable_gpu:
             flags += ["--gpus", "all"]
 
+        if self._egress is not None and self._egress.sidecar_id:
+            flags += [
+                "--network",
+                f"container:{self._egress.sidecar_id}",
+                "--cap-drop",
+                "NET_ADMIN",
+                "--cap-drop",
+                "NET_RAW",
+                "--security-opt",
+                "no-new-privileges=true",
+            ]
+
         run_cmd = [
             "docker",
             "run",
@@ -214,9 +239,12 @@ class DockerWorkspace(RemoteWorkspace):
     def _build_port_args(self) -> list[str]:
         """Publish the agent-server port (and optional VSCode/VNC ports).
 
-        Overridden when a sidecar owns the namespace: in that case the sidecar
-        publishes the ports and the workspace must publish none.
+        Returns an empty list when a sidecar owns the namespace: docker rejects
+        -p on a container using container: network mode, and the sidecar itself
+        publishes the ports on loopback.
         """
+        if self._egress is not None:
+            return []
         ports = ["-p", f"{self.host_port}:8000"]
         if self.extra_ports and self.host_port is not None:
             host_port = self.host_port
@@ -269,37 +297,50 @@ class DockerWorkspace(RemoteWorkspace):
                 "Docker Desktop/daemon."
             )
 
-        run_cmd = self._build_run_args(
-            image,
-            container_name=f"agent-server-{uuid.uuid4()}",
-            command=["--host", "0.0.0.0", "--port", "8000"],
-        )
-        proc = execute_command(run_cmd)
-        if proc.returncode != 0:
-            raise RuntimeError(f"Failed to run docker container: {proc.stderr}")
-
-        self._container_id = proc.stdout.strip()
-        logger.info(f"Started container: {self._container_id}")
-
-        # Optionally stream logs in background
-        if self.detach_logs:
-            self._logs_thread = threading.Thread(
-                target=self._stream_docker_logs, daemon=True
+        if self.network_policy.requires_sidecar:
+            self._egress = start_egress_sidecar(
+                self.network_policy,
+                host_port=self.host_port,
+                extra_ports=self.extra_ports,
             )
-            self._logs_thread.start()
 
-        # Set host for RemoteWorkspace to use
-        # The container exposes port 8000, mapped to self.host_port
-        # Override parent's host initialization
-        object.__setattr__(self, "host", f"http://localhost:{self.host_port}")
-        object.__setattr__(self, "api_key", None)
+        try:
+            run_cmd = self._build_run_args(
+                image,
+                container_name=f"agent-server-{uuid.uuid4()}",
+                command=["--host", "0.0.0.0", "--port", "8000"],
+            )
+            proc = execute_command(run_cmd)
+            if proc.returncode != 0:
+                raise RuntimeError(f"Failed to run docker container: {proc.stderr}")
 
-        # Wait for container to be healthy
-        self._wait_for_health()
-        logger.info(f"Docker workspace is ready at {self.host}")
+            self._container_id = proc.stdout.strip()
+            logger.info(f"Started container: {self._container_id}")
 
-        # Now initialize the parent RemoteWorkspace with the container URL
-        super().model_post_init(context)
+            # Optionally stream logs in background
+            if self.detach_logs:
+                self._logs_thread = threading.Thread(
+                    target=self._stream_docker_logs, daemon=True
+                )
+                self._logs_thread.start()
+
+            # Set host for RemoteWorkspace to use
+            # The container exposes port 8000, mapped to self.host_port
+            # Override parent's host initialization
+            object.__setattr__(self, "host", f"http://localhost:{self.host_port}")
+            object.__setattr__(self, "api_key", None)
+
+            # Wait for container to be healthy
+            self._wait_for_health()
+            logger.info(f"Docker workspace is ready at {self.host}")
+
+            # Now initialize the parent RemoteWorkspace with the container URL
+            super().model_post_init(context)
+        except BaseException:
+            if self._egress is not None:
+                self._egress.cleanup()
+                self._egress = None
+            raise
 
     def _stream_docker_logs(self) -> None:
         """Stream Docker logs to stdout in the background."""
@@ -386,6 +427,11 @@ class DockerWorkspace(RemoteWorkspace):
             logger.info(f"Stopping container: {self._container_id}")
             execute_command(["docker", "stop", self._container_id])
             self._container_id = None
+
+        # Release the egress sidecar after the workspace container is gone
+        if self._egress is not None:
+            self._egress.cleanup()
+            self._egress = None
 
         # Optionally delete the Docker image
         if self.cleanup_image and self._image_name:
