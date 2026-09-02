@@ -210,7 +210,13 @@ def start_egress_sidecar(
         os.chmod(directory, 0o700)
         rules_path = directory / "rules.nft"
         rules_path.write_text(rules_text, encoding="utf-8")
-        os.chmod(rules_path, 0o600)
+        # 0o644, not 0o600: the sidecar runs with --cap-drop ALL --cap-add NET_ADMIN,
+        # which removes CAP_DAC_OVERRIDE — the capability that normally lets root
+        # bypass permission checks.  Without it, uid-0 inside the container cannot
+        # read a file it does not own that is mode 0o600.  0o644 (world-readable)
+        # is safe because the parent directory is 0o700, so host users without
+        # access to that directory cannot reach the file at all.
+        os.chmod(rules_path, 0o644)
         runtime.rules_path = rules_path
         runtime.write_manifest()
 

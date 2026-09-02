@@ -157,3 +157,69 @@ def test_cleanup_continues_after_one_resource_fails():
         runtime.cleanup()
         issued = [" ".join(c.args[0]) for c in mock_exec.call_args_list]
     assert any("network" in cmd and "rm" in cmd for cmd in issued)
+
+
+def test_rules_file_is_world_readable_and_directory_is_not(tmp_path, monkeypatch):
+    """Rules file must be 0o644; directory must remain 0o700.
+
+    The sidecar runs with --cap-drop ALL --cap-add NET_ADMIN, which strips
+    CAP_DAC_OVERRIDE.  Without that capability uid-0 cannot read a file it
+    does not own that is mode 0o600.  0o644 allows the read while the 0o700
+    directory still blocks host users who lack directory-traverse permission.
+
+    This test will fail if the chmod in start_egress_sidecar is reverted to
+    0o600 or if the directory is accidentally loosened to 0o755.
+    """
+    import openhands.workspace.docker.egress_runtime as _rt
+
+    monkeypatch.setattr(_rt, "STATE_ROOT", tmp_path)
+
+    # Stub every docker call so no daemon is needed.
+    fake_network_id = "fakenetid123"
+    call_count = {"n": 0}
+
+    def fake_exec(cmd, *args, **kwargs):
+        call_count["n"] += 1
+        # docker network create -> return a network id
+        if "network" in cmd and "create" in cmd:
+            return Mock(returncode=0, stdout=fake_network_id, stderr="")
+        # docker network inspect (subnets) -> return a non-overlapping range
+        if "network" in cmd and "inspect" in cmd:
+            return Mock(returncode=0, stdout="172.30.0.0/16 ", stderr="")
+        # docker run -> pretend the container started
+        if "run" in cmd:
+            return Mock(returncode=0, stdout="fakesidecarid", stderr="")
+        # docker exec (readiness probe) -> signal ready immediately
+        if "exec" in cmd:
+            return Mock(returncode=0, stdout="", stderr="")
+        # anything else (stop, rm, network rm) -> success
+        return Mock(returncode=0, stdout="", stderr="")
+
+    with patch(
+        "openhands.workspace.docker.egress_runtime.execute_command",
+        side_effect=fake_exec,
+    ):
+        runtime = _rt.start_egress_sidecar(
+            WorkspaceNetworkPolicy(mode="no-network"),
+            host_port=39999,
+        )
+
+    try:
+        assert runtime.rules_path is not None
+        file_mode = runtime.rules_path.stat().st_mode & 0o777
+        dir_mode = runtime.rules_path.parent.stat().st_mode & 0o777
+        assert file_mode == 0o644, (
+            f"rules file mode is {oct(file_mode)}, want 0o644; "
+            "the sidecar runs --cap-drop ALL which removes CAP_DAC_OVERRIDE "
+            "and uid-0 cannot read a 0o600 file it does not own"
+        )
+        assert dir_mode == 0o700, (
+            f"rules directory mode is {oct(dir_mode)}, want 0o700; "
+            "loosening the directory would expose the rules file to other host users"
+        )
+    finally:
+        with patch(
+            "openhands.workspace.docker.egress_runtime.execute_command",
+            return_value=Mock(returncode=0, stdout="", stderr=""),
+        ):
+            runtime.cleanup()
