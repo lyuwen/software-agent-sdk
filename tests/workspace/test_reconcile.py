@@ -124,3 +124,96 @@ def test_one_failure_does_not_stop_the_scan(state_root):
         mock_exec.side_effect = flaky
         reclaimed = reconcile_orphans()
     assert "ws-b" in reclaimed
+
+
+@pytest.fixture
+def nested_root(tmp_path, monkeypatch):
+    """STATE_ROOT one level down so a canary can live outside it."""
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(egress_runtime, "STATE_ROOT", root)
+    return root
+
+
+def _canary(tmp_path):
+    """A directory outside STATE_ROOT that must survive reconciliation."""
+    victim = tmp_path / "precious"
+    victim.mkdir()
+    (victim / "keepme.txt").write_text("do not delete")
+    (victim / "alsokeep.txt").write_text("nor this")
+    return victim
+
+
+def _write_raw_manifest(root, workspace_id, rules_path):
+    directory = root / workspace_id
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "manifest.json").write_text(
+        json.dumps(
+            {
+                "workspace_id": workspace_id,
+                "controller_id": "ffffffff-0-aaaaaaaa",
+                "network_id": None,
+                "sidecar_id": None,
+                "rules_path": str(rules_path),
+                "policy_digest": "deadbeef",
+                "status": "active",
+                "lease_expires_at": 0,
+            }
+        )
+    )
+    return directory
+
+
+def test_rules_path_outside_state_root_is_skipped(nested_root, tmp_path):
+    """A planted manifest must not delete files outside the state root."""
+    victim = _canary(tmp_path)
+    directory = _write_raw_manifest(nested_root, "ws-evil", victim / "keepme.txt")
+    with patch.object(egress_runtime, "execute_command") as mock_exec:
+        mock_exec.return_value = Mock(returncode=0, stdout="", stderr="")
+        reclaimed = reconcile_orphans()
+    assert reclaimed == []
+    assert victim.is_dir()
+    assert (victim / "keepme.txt").exists()
+    assert (victim / "alsokeep.txt").exists()
+    assert directory.exists()
+
+
+def test_rules_path_traversal_is_rejected(nested_root, tmp_path):
+    """`..` traversal out of the state root must be rejected too."""
+    victim = _canary(tmp_path)
+    escape = nested_root / "ws-trav" / ".." / ".." / "precious" / "keepme.txt"
+    directory = _write_raw_manifest(nested_root, "ws-trav", escape)
+    with patch.object(egress_runtime, "execute_command") as mock_exec:
+        mock_exec.return_value = Mock(returncode=0, stdout="", stderr="")
+        reclaimed = reconcile_orphans()
+    assert reclaimed == []
+    assert (victim / "keepme.txt").exists()
+    assert (victim / "alsokeep.txt").exists()
+    assert directory.exists()
+
+
+def test_cleanup_refuses_out_of_root_rules_path(nested_root, tmp_path):
+    """Layer 2: cleanup() called directly must bound its own blast radius."""
+    victim = _canary(tmp_path)
+    runtime = egress_runtime.EgressRuntime(
+        workspace_id="ws-direct",
+        controller_id="ffffffff-0-aaaaaaaa",
+        rules_path=victim / "keepme.txt",
+    )
+    with patch.object(egress_runtime, "execute_command") as mock_exec:
+        mock_exec.return_value = Mock(returncode=0, stdout="", stderr="")
+        runtime.cleanup()
+    assert victim.is_dir()
+    assert (victim / "keepme.txt").exists()
+    assert (victim / "alsokeep.txt").exists()
+
+
+def test_in_root_cleanup_still_removes_everything(nested_root):
+    """No regression: the normal path must leave zero residue."""
+    _write_manifest(nested_root, "ws-ok", "boot1234-0-abcd1234", time.time() - 999)
+    with patch.object(egress_runtime, "execute_command") as mock_exec:
+        mock_exec.return_value = Mock(returncode=0, stdout="", stderr="")
+        reclaimed = reconcile_orphans()
+    assert reclaimed == ["ws-ok"]
+    assert not (nested_root / "ws-ok").exists()
+    assert list(nested_root.iterdir()) == []

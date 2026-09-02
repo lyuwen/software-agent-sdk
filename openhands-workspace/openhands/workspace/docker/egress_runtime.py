@@ -3,6 +3,7 @@
 import json
 import os
 import secrets
+import stat
 import tempfile
 import threading
 import time
@@ -29,6 +30,63 @@ STOP_TIMEOUT_SECONDS = 10
 LEASE_STALE_SECONDS = 120.0
 
 LABEL_MANAGED = "workspace.managed=true"
+
+
+def _within_state_root(path: Path) -> bool:
+    """Whether ``path`` resolves to a location strictly beneath STATE_ROOT.
+
+    Both sides are fully resolved so that ``..`` segments and symlinks cannot
+    be used to escape; containment is then decided structurally with
+    ``is_relative_to`` rather than by string prefix, which would accept a
+    sibling such as ``/var/tmp/openhands-egress-evil``. STATE_ROOT itself is
+    not "beneath" itself, so the root can never be wiped.
+    """
+    try:
+        root = STATE_ROOT.resolve()
+        target = path.resolve()
+    except OSError:
+        return False
+    return target != root and target.is_relative_to(root)
+
+
+def ensure_state_root() -> Path:
+    """Create STATE_ROOT private to this user and return it."""
+    STATE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return STATE_ROOT
+
+
+def _state_root_is_trustworthy() -> bool:
+    """Whether manifests found in STATE_ROOT may be acted upon at all.
+
+    Reconciliation deletes resources named by files it reads, so the directory
+    those files come from must not be writable by other users. The default
+    root lives under world-writable /var/tmp, where any local user could
+    pre-create it and plant manifests. Refuse rather than repair: silently
+    chmod-ing a directory owned by somebody else would be its own bug.
+    """
+    try:
+        info = STATE_ROOT.stat()
+    except OSError as exc:
+        logger.warning("cannot stat egress state root %s: %s", STATE_ROOT, exc)
+        return False
+    if info.st_uid != os.getuid():
+        logger.warning(
+            "refusing to reconcile: egress state root %s is owned by uid %d, "
+            "not the current user (uid %d)",
+            STATE_ROOT,
+            info.st_uid,
+            os.getuid(),
+        )
+        return False
+    if info.st_mode & stat.S_IWOTH:
+        logger.warning(
+            "refusing to reconcile: egress state root %s is world-writable "
+            "(mode %o); another local user could plant manifests there",
+            STATE_ROOT,
+            stat.S_IMODE(info.st_mode),
+        )
+        return False
+    return True
 
 
 def controller_id() -> str:
@@ -81,6 +139,7 @@ class EgressRuntime:
     def write_manifest(self, status: str = "active") -> None:
         """Atomically record acquired resources so a later pass can reconcile."""
         directory = self.manifest_path.parent
+        ensure_state_root()
         directory.mkdir(parents=True, exist_ok=True)
         payload = {
             "workspace_id": self.workspace_id,
@@ -147,15 +206,24 @@ class EgressRuntime:
                 ["docker", "network", "rm", self.network_id],
             )
         if self.rules_path:
-            try:
-                self.rules_path.unlink(missing_ok=True)
-                parent = self.rules_path.parent
-                if parent != STATE_ROOT and parent.is_dir():
-                    for leftover in parent.iterdir():
-                        leftover.unlink(missing_ok=True)
-                    parent.rmdir()
-            except OSError as exc:
-                errors.append(f"remove rules {self.rules_path}: {exc}")
+            # Bound the blast radius here, not only in the caller: cleanup()
+            # removes every file in the rules directory, so a rules_path that
+            # came from an untrusted manifest must never be honoured.
+            if not _within_state_root(self.rules_path):
+                errors.append(
+                    f"refusing to remove rules {self.rules_path}: "
+                    f"outside state root {STATE_ROOT}"
+                )
+            else:
+                try:
+                    self.rules_path.unlink(missing_ok=True)
+                    parent = self.rules_path.parent
+                    if _within_state_root(parent) and parent.is_dir():
+                        for leftover in parent.iterdir():
+                            leftover.unlink(missing_ok=True)
+                        parent.rmdir()
+                except OSError as exc:
+                    errors.append(f"remove rules {self.rules_path}: {exc}")
 
         if errors:
             logger.warning(
@@ -163,7 +231,7 @@ class EgressRuntime:
                 self.workspace_id,
                 "; ".join(errors),
             )
-        else:
+        elif _within_state_root(self.manifest_path):
             self.manifest_path.unlink(missing_ok=True)
 
 
@@ -205,8 +273,8 @@ def start_egress_sidecar(
         # 1. Rules file, private to this controller.
         rules_text = render_rules(policy)
         runtime.policy_digest = policy_digest(rules_text)
-        directory = STATE_ROOT / workspace_id
-        directory.mkdir(parents=True, exist_ok=True)
+        directory = ensure_state_root() / workspace_id
+        directory.mkdir(exist_ok=True, mode=0o700)
         os.chmod(directory, 0o700)
         rules_path = directory / "rules.nft"
         rules_path.write_text(rules_text, encoding="utf-8")
@@ -401,6 +469,8 @@ def reconcile_orphans(now: float | None = None) -> list[str]:
     reclaimed: list[str] = []
     if not STATE_ROOT.is_dir():
         return reclaimed
+    if not _state_root_is_trustworthy():
+        return reclaimed
 
     for directory in sorted(STATE_ROOT.iterdir()):
         manifest_file = directory / "manifest.json"
@@ -422,12 +492,34 @@ def reconcile_orphans(now: float | None = None) -> list[str]:
             "reconciling orphaned workspace %s (controller %s)", workspace_id, cid
         )
         raw_rules = manifest.get("rules_path")
+        rules_path = Path(str(raw_rules)) if raw_rules else None
+        # A manifest is untrusted input: it names paths that cleanup() will
+        # delete. Honour only paths that stay beneath the state root, and skip
+        # the whole entry otherwise -- do not reclaim it, do not delete for it.
+        if rules_path is not None and not _within_state_root(rules_path):
+            logger.warning(
+                "skipping manifest %s: rules_path %s escapes state root %s",
+                manifest_file,
+                rules_path,
+                STATE_ROOT,
+            )
+            continue
+        # workspace_id is likewise attacker-controlled and feeds manifest_path.
+        if not _within_state_root(STATE_ROOT / workspace_id / "manifest.json"):
+            logger.warning(
+                "skipping manifest %s: workspace_id %r escapes state root %s",
+                manifest_file,
+                workspace_id,
+                STATE_ROOT,
+            )
+            continue
+
         runtime = EgressRuntime(
             workspace_id=workspace_id,
             controller_id=cid,
             network_id=manifest.get("network_id"),
             sidecar_id=manifest.get("sidecar_id"),
-            rules_path=Path(raw_rules) if raw_rules else None,
+            rules_path=rules_path,
         )
         try:
             runtime.cleanup()  # container before network, best-effort
