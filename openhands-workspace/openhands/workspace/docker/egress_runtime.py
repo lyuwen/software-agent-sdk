@@ -340,3 +340,102 @@ def start_egress_sidecar(
     except BaseException:
         runtime.cleanup()
         raise
+
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _is_boot_prefix(text: str) -> bool:
+    """Whether a controller id's first field is a real boot-id prefix.
+
+    ``controller_id()`` falls back to ``"noboot"`` where /proc is unavailable,
+    and ids minted elsewhere may carry anything at all. Only an 8-character
+    hex prefix -- what a boot uuid actually looks like -- can be compared.
+    """
+    return len(text) == 8 and all(char in _HEX_DIGITS for char in text)
+
+
+def controller_is_alive(cid: str) -> bool:
+    """Whether the controller that created a resource still exists.
+
+    Returns True whenever liveness cannot be determined. Reclaiming a live
+    controller's workspace destroys a running evaluation; leaving a leaked
+    container costs disk until the next pass. Bias to leaving it alone.
+    """
+    parts = cid.split("-")
+    if len(parts) != 3:
+        return True  # unparseable: do not touch
+    boot, pid_text, _nonce = parts
+    try:
+        current_boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()[:8]
+    except OSError:
+        return True  # cannot compare: do not touch
+    # A differing boot id is decisive only when it is genuinely a boot-id
+    # prefix. Anything else says nothing about which boot minted the id, so
+    # fall through to the pid check rather than declaring the controller dead.
+    if _is_boot_prefix(boot) and boot != current_boot:
+        return False  # host rebooted: the process cannot exist
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        return True
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+    return True
+
+
+def reconcile_orphans(now: float | None = None) -> list[str]:
+    """Remove managed resources whose controller is gone. Returns reclaimed IDs.
+
+    Runs before a worker accepts work. Only acts on a complete, readable
+    manifest whose controller is provably dead AND whose lease has expired.
+    Continues scanning after individual failures.
+    """
+    current = time.time() if now is None else now
+    reclaimed: list[str] = []
+    if not STATE_ROOT.is_dir():
+        return reclaimed
+
+    for directory in sorted(STATE_ROOT.iterdir()):
+        manifest_file = directory / "manifest.json"
+        if not manifest_file.is_file():
+            continue
+        try:
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            workspace_id = str(manifest["workspace_id"])
+            cid = str(manifest["controller_id"])
+            lease = float(manifest["lease_expires_at"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            logger.warning("skipping unreadable manifest %s: %s", manifest_file, exc)
+            continue
+
+        if lease > current or controller_is_alive(cid):
+            continue
+
+        logger.info(
+            "reconciling orphaned workspace %s (controller %s)", workspace_id, cid
+        )
+        raw_rules = manifest.get("rules_path")
+        runtime = EgressRuntime(
+            workspace_id=workspace_id,
+            controller_id=cid,
+            network_id=manifest.get("network_id"),
+            sidecar_id=manifest.get("sidecar_id"),
+            rules_path=Path(raw_rules) if raw_rules else None,
+        )
+        try:
+            runtime.cleanup()  # container before network, best-effort
+            manifest_file.unlink(missing_ok=True)
+            if directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+            reclaimed.append(workspace_id)
+        except Exception as exc:  # noqa: BLE001 - keep scanning
+            logger.warning("reconciliation failed for %s: %s", workspace_id, exc)
+
+    return reclaimed
