@@ -437,6 +437,14 @@ class DockerWorkspace(RemoteWorkspace):
             self._container_id = proc.stdout.strip()
             logger.info(f"Started container: {self._container_id}")
 
+            if self._egress is not None:
+                # Record the container before waiting on health: if this
+                # process dies during the wait, the manifest must already name
+                # the container a reconciliation pass has to reclaim, since it
+                # holds the sidecar's network namespace.
+                self._egress.workspace_container_id = self._container_id
+                self._egress.write_manifest()
+
             # Optionally stream logs in background
             if self.detach_logs:
                 self._logs_thread = threading.Thread(
@@ -499,6 +507,10 @@ class DockerWorkspace(RemoteWorkspace):
         # present -- and still holding the sidecar's network namespace.
         execute_command(["docker", "rm", "-f", container_id])
         self._container_id = None
+        if self._egress is not None:
+            # Stop naming a container we just removed, so a later pass does not
+            # report a failure trying to remove it again.
+            self._egress.workspace_container_id = None
 
     def _release_egress(self) -> None:
         """Release the egress sidecar and its network."""

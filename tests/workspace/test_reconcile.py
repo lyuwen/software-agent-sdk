@@ -217,3 +217,123 @@ def test_in_root_cleanup_still_removes_everything(nested_root):
     assert reclaimed == ["ws-ok"]
     assert not (nested_root / "ws-ok").exists()
     assert list(nested_root.iterdir()) == []
+
+
+def _write_manifest_with_container(root, workspace_id, container_id):
+    directory = root / workspace_id
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "manifest.json").write_text(
+        json.dumps(
+            {
+                "workspace_id": workspace_id,
+                "controller_id": "boot1234-0-abcd1234",
+                "network_id": f"{workspace_id}-net",
+                "sidecar_id": f"{workspace_id}-side",
+                "workspace_container_id": container_id,
+                "rules_path": str(directory / "rules.nft"),
+                "policy_digest": "deadbeef",
+                "status": "active",
+                "lease_expires_at": time.time() - 999,
+            }
+        )
+    )
+    (directory / "rules.nft").write_text("table inet workspace_egress {}\n")
+    return directory
+
+
+def test_reconcile_reclaims_the_leaked_main_container(state_root):
+    """The manifest records the workspace container, so it can be reclaimed."""
+    _write_manifest_with_container(state_root, "ws-main", "main-container-id")
+    with patch.object(egress_runtime, "execute_command") as mock_exec:
+        mock_exec.return_value = Mock(returncode=0, stdout="", stderr="")
+        reclaimed = reconcile_orphans()
+        issued = [" ".join(c.args[0]) for c in mock_exec.call_args_list]
+    assert reclaimed == ["ws-main"]
+    assert any("rm" in c and "main-container-id" in c for c in issued)
+
+
+def test_main_container_is_removed_before_the_network(state_root):
+    """It holds the sidecar's namespace, so it must go first."""
+    _write_manifest_with_container(state_root, "ws-order2", "main-container-id")
+    with patch.object(egress_runtime, "execute_command") as mock_exec:
+        mock_exec.return_value = Mock(returncode=0, stdout="", stderr="")
+        reconcile_orphans()
+        issued = [" ".join(c.args[0]) for c in mock_exec.call_args_list]
+    main_idx = next(i for i, c in enumerate(issued) if "main-container-id" in c)
+    network_idx = next(i for i, c in enumerate(issued) if "ws-order2-net" in c)
+    assert main_idx < network_idx
+
+
+def test_failed_cleanup_keeps_the_manifest_and_is_not_reclaimed(state_root):
+    """Erasing the record of a resource that survived makes it unreclaimable."""
+    directory = _write_manifest(
+        state_root, "ws-stuck", "boot1234-0-abcd1234", time.time() - 999
+    )
+    with patch.object(egress_runtime, "execute_command") as mock_exec:
+
+        def fail_network_rm(cmd, *a, **kw):
+            if "network" in cmd and "rm" in cmd:
+                return Mock(returncode=1, stdout="", stderr="network has endpoints")
+            return Mock(returncode=0, stdout="", stderr="")
+
+        mock_exec.side_effect = fail_network_rm
+        reclaimed = reconcile_orphans()
+
+    assert reclaimed == [], "a workspace whose resources survived was reported gone"
+    manifest_file = directory / "manifest.json"
+    assert manifest_file.is_file(), "the only record needed to retry was discarded"
+    record = json.loads(manifest_file.read_text())
+    assert record["status"] == "cleanup_failed"
+    assert record["cleanup_errors"], "the failure detail was not recorded"
+    assert record["lease_expires_at"] <= time.time(), (
+        "the lease must be expired so the next pass retries immediately"
+    )
+    assert record["network_id"] == "ws-stuck-net"
+
+
+def test_a_later_pass_retries_and_then_reclaims(state_root):
+    """The retry succeeds once the blocking resource is gone."""
+    _write_manifest(state_root, "ws-retry", "boot1234-0-abcd1234", time.time() - 999)
+    with patch.object(egress_runtime, "execute_command") as mock_exec:
+        mock_exec.side_effect = lambda cmd, *a, **kw: (
+            Mock(returncode=1, stdout="", stderr="network has endpoints")
+            if ("network" in cmd and "rm" in cmd)
+            else Mock(returncode=0, stdout="", stderr="")
+        )
+        assert reconcile_orphans() == []
+
+    with patch.object(egress_runtime, "execute_command") as mock_exec:
+        mock_exec.return_value = Mock(returncode=0, stdout="", stderr="")
+        assert reconcile_orphans() == ["ws-retry"]
+    assert not (state_root / "ws-retry").exists()
+
+
+def test_already_absent_resources_do_not_count_as_failures(state_root):
+    """A partial earlier pass must not wedge the retry forever."""
+    _write_manifest(state_root, "ws-gone", "boot1234-0-abcd1234", time.time() - 999)
+    with patch.object(egress_runtime, "execute_command") as mock_exec:
+        mock_exec.return_value = Mock(
+            returncode=1, stdout="", stderr="Error: No such container: ws-gone-side"
+        )
+        assert reconcile_orphans() == ["ws-gone"]
+    assert not (state_root / "ws-gone").exists()
+
+
+def test_cleanup_returns_its_errors():
+    runtime = egress_runtime.EgressRuntime(
+        workspace_id="ws1", controller_id="ctrl1", sidecar_id="side1", network_id="net1"
+    )
+    with patch.object(egress_runtime, "execute_command") as mock_exec:
+        mock_exec.return_value = Mock(returncode=1, stdout="", stderr="boom")
+        errors = runtime.cleanup()
+    assert errors, "cleanup reported success while every removal failed"
+    assert runtime.cleanup() == errors, "repeat cleanup must report the same outcome"
+
+
+def test_cleanup_returns_empty_on_success():
+    runtime = egress_runtime.EgressRuntime(
+        workspace_id="ws1", controller_id="ctrl1", sidecar_id="side1", network_id="net1"
+    )
+    with patch.object(egress_runtime, "execute_command") as mock_exec:
+        mock_exec.return_value = Mock(returncode=0, stdout="", stderr="")
+        assert runtime.cleanup() == []

@@ -31,6 +31,13 @@ LEASE_STALE_SECONDS = 120.0
 
 LABEL_MANAGED = "workspace.managed=true"
 
+POLICY_DIGEST_ENV = "OH_EGRESS_POLICY_DIGEST"
+"""Env var carrying the expected policy digest into the sidecar.
+
+The entrypoint recomputes the sha256 of the mounted rules file and refuses to
+apply it -- failing closed, without publishing readiness -- unless it matches.
+"""
+
 
 def _within_state_root(path: Path) -> bool:
     """Whether ``path`` resolves to a location strictly beneath STATE_ROOT.
@@ -127,17 +134,32 @@ class EgressRuntime:
     controller_id: str
     network_id: str | None = None
     sidecar_id: str | None = None
+    #: The workspace container itself. Recorded so a reconciliation pass can
+    #: reclaim it: it holds the sidecar's network namespace, so without it a
+    #: leaked workspace container blocks removal of the sidecar and network.
+    workspace_container_id: str | None = None
     rules_path: Path | None = None
     policy_digest: str | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _cleaned: bool = field(default=False, repr=False)
+    _cleanup_errors: list[str] = field(default_factory=list, repr=False)
 
     @property
     def manifest_path(self) -> Path:
         return STATE_ROOT / self.workspace_id / "manifest.json"
 
-    def write_manifest(self, status: str = "active") -> None:
-        """Atomically record acquired resources so a later pass can reconcile."""
+    def write_manifest(
+        self,
+        status: str = "active",
+        *,
+        lease_seconds: float = LEASE_STALE_SECONDS,
+        errors: list[str] | None = None,
+    ) -> None:
+        """Atomically record acquired resources so a later pass can reconcile.
+
+        ``lease_seconds`` of 0 writes an already-expired lease, which is how a
+        failed cleanup asks the next pass to retry immediately.
+        """
         directory = self.manifest_path.parent
         ensure_state_root()
         directory.mkdir(parents=True, exist_ok=True)
@@ -146,10 +168,12 @@ class EgressRuntime:
             "controller_id": self.controller_id,
             "network_id": self.network_id,
             "sidecar_id": self.sidecar_id,
+            "workspace_container_id": self.workspace_container_id,
             "rules_path": str(self.rules_path) if self.rules_path else None,
             "policy_digest": self.policy_digest,
             "status": status,
-            "lease_expires_at": time.time() + LEASE_STALE_SECONDS,
+            "cleanup_errors": errors or [],
+            "lease_expires_at": time.time() + lease_seconds,
         }
         fd, tmp = tempfile.mkstemp(dir=str(directory), suffix=".tmp")
         try:
@@ -170,15 +194,21 @@ class EgressRuntime:
         )
         return proc.stdout.strip() == "true"
 
-    def cleanup(self) -> None:
+    def cleanup(self) -> list[str]:
         """Release every acquired resource. Idempotent and thread-safe.
 
         Best-effort across resources: a failure removing one resource must not
         prevent the removal of the others.
+
+        Returns:
+            The aggregated failure messages -- empty when every resource was
+            genuinely removed. A caller holding the only record of these
+            resources (reconciliation) must check this before discarding it.
+            Repeat calls return the outcome of the pass that ran.
         """
         with self._lock:
             if self._cleaned:
-                return
+                return list(self._cleanup_errors)
             self._cleaned = True
 
         errors: list[str] = []
@@ -187,10 +217,33 @@ class EgressRuntime:
             try:
                 proc = execute_command(cmd, print_output=False)
                 if proc.returncode != 0:
-                    errors.append(f"{label}: {proc.stderr.strip()}")
+                    detail = proc.stderr.strip()
+                    # A resource that is already gone is the desired end state,
+                    # not a failure -- otherwise a retry after a partial pass
+                    # could never succeed.
+                    if _already_absent(detail):
+                        return
+                    errors.append(f"{label}: {detail}")
             except Exception as exc:  # noqa: BLE001 - aggregate and continue
                 errors.append(f"{label}: {exc}")
 
+        # The workspace container holds the sidecar's network namespace, so it
+        # must go before the sidecar and the network.
+        if self.workspace_container_id:
+            attempt(
+                f"stop workspace container {self.workspace_container_id}",
+                [
+                    "docker",
+                    "stop",
+                    "-t",
+                    str(STOP_TIMEOUT_SECONDS),
+                    self.workspace_container_id,
+                ],
+            )
+            attempt(
+                f"remove workspace container {self.workspace_container_id}",
+                ["docker", "rm", "-f", self.workspace_container_id],
+            )
         if self.sidecar_id:
             attempt(
                 f"stop sidecar {self.sidecar_id}",
@@ -217,22 +270,38 @@ class EgressRuntime:
             else:
                 try:
                     self.rules_path.unlink(missing_ok=True)
-                    parent = self.rules_path.parent
-                    if _within_state_root(parent) and parent.is_dir():
-                        for leftover in parent.iterdir():
-                            leftover.unlink(missing_ok=True)
-                        parent.rmdir()
                 except OSError as exc:
                     errors.append(f"remove rules {self.rules_path}: {exc}")
 
+        self._cleanup_errors = errors
         if errors:
             logger.warning(
                 "egress cleanup for %s completed with errors: %s",
                 self.workspace_id,
                 "; ".join(errors),
             )
-        elif _within_state_root(self.manifest_path):
+            # Deliberately keep the manifest and its directory: something
+            # survived, and this is the only record of what.
+            return list(errors)
+
+        # Everything is gone, so the recovery record can go too.
+        if _within_state_root(self.manifest_path):
             self.manifest_path.unlink(missing_ok=True)
+            directory = self.manifest_path.parent
+            if _within_state_root(directory) and directory.is_dir():
+                for leftover in directory.iterdir():
+                    leftover.unlink(missing_ok=True)
+                directory.rmdir()
+        return []
+
+
+_ABSENT_MARKERS = ("no such container", "no such network", "not found")
+
+
+def _already_absent(stderr: str) -> bool:
+    """Whether docker failed only because the resource is already gone."""
+    lowered = stderr.lower()
+    return any(marker in lowered for marker in _ABSENT_MARKERS)
 
 
 def _network_subnets(network_id: str) -> list[IPv4Network | IPv6Network]:
@@ -352,6 +421,11 @@ def start_egress_sidecar(
                 "--read-only",
                 "--tmpfs",
                 "/tmp:rw,noexec,nosuid,nodev,size=1m",
+                # The sidecar recomputes this over the rules file it was given
+                # and refuses to apply anything else, so it verifies the policy
+                # that was REQUESTED rather than merely that some ruleset loaded.
+                "-e",
+                f"{POLICY_DIGEST_ENV}={runtime.policy_digest}",
                 *publish,
                 "--label",
                 LABEL_MANAGED,
@@ -519,10 +593,27 @@ def reconcile_orphans(now: float | None = None) -> list[str]:
             controller_id=cid,
             network_id=manifest.get("network_id"),
             sidecar_id=manifest.get("sidecar_id"),
+            workspace_container_id=manifest.get("workspace_container_id"),
             rules_path=rules_path,
         )
         try:
-            runtime.cleanup()  # container before network, best-effort
+            # container before network, best-effort; errors are reported, not
+            # raised, so the outcome has to be inspected rather than assumed.
+            errors = runtime.cleanup()
+            if errors:
+                # Something survived and can still block network removal.
+                # Discarding the manifest here would destroy the only record
+                # needed to retry, so keep it -- with the failure detail and an
+                # already-expired lease, so the next pass picks it straight up.
+                logger.warning(
+                    "reconciliation for %s did not remove everything: %s",
+                    workspace_id,
+                    "; ".join(errors),
+                )
+                runtime.write_manifest(
+                    "cleanup_failed", lease_seconds=0.0, errors=errors
+                )
+                continue
             manifest_file.unlink(missing_ok=True)
             if directory.is_dir() and not any(directory.iterdir()):
                 directory.rmdir()

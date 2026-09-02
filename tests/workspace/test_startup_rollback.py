@@ -115,3 +115,30 @@ def test_flex_rollback_also_removes_the_plugin_container():
         c for c in issued if c[:3] == ["docker", "rm", "-f"] and "plugin" in c[3]
     ]
     assert flex_removals, "the plugin data container was leaked on rollback"
+
+
+def test_workspace_container_id_is_recorded_in_the_manifest():
+    """Reconciliation cannot reclaim a container the manifest never names."""
+    egress = Mock(sidecar_id="sidecar123", workspace_container_id=None)
+    with (
+        patch(
+            "openhands.workspace.docker.workspace.execute_command",
+            side_effect=_fake_exec,
+        ),
+        patch(
+            "openhands.workspace.docker.workspace.start_egress_sidecar",
+            return_value=egress,
+        ),
+        patch.object(DockerWorkspace, "_wait_for_health"),
+        patch("openhands.sdk.workspace.RemoteWorkspace.model_post_init"),
+    ):
+        ws = DockerWorkspace(
+            server_image="srv:latest",
+            network_policy=WorkspaceNetworkPolicy(mode="no-network"),
+            detach_logs=False,
+        )
+        recorded = egress.workspace_container_id
+        assert egress.write_manifest.called, "the manifest was never updated"
+        ws._container_id = None
+        ws._egress = None
+    assert recorded == "maincontainerid"
