@@ -6,21 +6,21 @@ module is cheap to unit test.
 
 import os
 from collections.abc import Mapping
-from ipaddress import IPv4Network, IPv6Network, ip_network
+from ipaddress import IPv4Address, IPv4Network, IPv6Network
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-INTERNAL_BASELINE: IPv4Network = ip_network("10.0.0.0/8")
+INTERNAL_BASELINE: IPv4Network = IPv4Network("10.0.0.0/8")
 """Mandatory internal destination: LLM proxy and package mirrors live here."""
 
-NetworkMode = Literal[
-    "public", "static-allowlist", "no-network", "strict-no-network"
-]
+NetworkMode = Literal["public", "static-allowlist", "no-network", "strict-no-network"]
 
 _STEP2_MODES = frozenset({"host-allowlist", "public-bootstrap"})
-_VALID_MODES = frozenset({"public", "static-allowlist", "no-network", "strict-no-network"})
+_VALID_MODES = frozenset(
+    {"public", "static-allowlist", "no-network", "strict-no-network"}
+)
 
 MAX_ENDPOINTS = 64
 MAX_PORTS_PER_ENDPOINT = 32
@@ -70,11 +70,12 @@ class AllowedEndpoint(BaseModel):
             raise ValueError(f"multicast destination not allowed: {v}")
         if v.is_link_local:
             raise ValueError(f"link-local destination not allowed: {v}")
-        if v.is_unspecified or int(v.network_address) == 0:
+        if int(v.network_address) == 0:
             raise ValueError(f"unspecified destination not allowed: {v}")
-        if isinstance(v, IPv4Network) and v.broadcast_address == v.network_address:
-            if str(v.network_address) == "255.255.255.255":
-                raise ValueError(f"broadcast destination not allowed: {v}")
+        if isinstance(v, IPv4Network) and v.network_address == IPv4Address(
+            "255.255.255.255"
+        ):
+            raise ValueError(f"broadcast destination not allowed: {v}")
         return v
 
     @field_validator("ports")

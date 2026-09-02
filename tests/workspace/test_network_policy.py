@@ -63,7 +63,11 @@ def test_narrowing_the_baseline_still_yields_the_full_baseline():
     policy = WorkspaceNetworkPolicy(
         mode="static-allowlist",
         allowed_endpoints=(
-            AllowedEndpoint(destination=ip_network("10.1.2.0/24"), protocol="tcp", ports=(443,)),
+            AllowedEndpoint(
+                destination=ip_network("10.1.2.0/24"),
+                protocol="tcp",
+                ports=(443,),
+            ),
         ),
     )
     unrestricted = [
@@ -78,7 +82,9 @@ def test_no_network_rejects_caller_endpoints():
     with pytest.raises(ValidationError, match="no-network"):
         WorkspaceNetworkPolicy(
             mode="no-network",
-            allowed_endpoints=(AllowedEndpoint(destination=ip_network("192.0.2.0/24")),),
+            allowed_endpoints=(
+                AllowedEndpoint(destination=ip_network("192.0.2.0/24")),
+            ),
         )
 
 
@@ -86,24 +92,37 @@ def test_public_rejects_allowlist_fields():
     with pytest.raises(ValidationError, match="public"):
         WorkspaceNetworkPolicy(
             mode="public",
-            allowed_endpoints=(AllowedEndpoint(destination=ip_network("192.0.2.0/24")),),
+            allowed_endpoints=(
+                AllowedEndpoint(destination=ip_network("192.0.2.0/24")),
+            ),
         )
 
 
 def test_protocol_requires_nonempty_ports():
     with pytest.raises(ValidationError, match="ports"):
-        AllowedEndpoint(destination=ip_network("192.0.2.0/24"), protocol="tcp", ports=())
+        AllowedEndpoint(
+            destination=ip_network("192.0.2.0/24"),
+            protocol="tcp",
+            ports=(),
+        )
 
 
 def test_ports_require_protocol():
     with pytest.raises(ValidationError, match="protocol"):
-        AllowedEndpoint(destination=ip_network("192.0.2.0/24"), ports=(443,))
+        AllowedEndpoint(
+            destination=ip_network("192.0.2.0/24"),
+            ports=(443,),
+        )
 
 
 @pytest.mark.parametrize("port", [0, 65536, -1])
 def test_port_range_enforced(port):
     with pytest.raises(ValidationError):
-        AllowedEndpoint(destination=ip_network("192.0.2.0/24"), protocol="tcp", ports=(port,))
+        AllowedEndpoint(
+            destination=ip_network("192.0.2.0/24"),
+            protocol="tcp",
+            ports=(port,),
+        )
 
 
 @pytest.mark.parametrize(
@@ -121,3 +140,27 @@ def test_env_unset_gives_public():
 def test_env_invalid_raises():
     with pytest.raises(ValueError):
         policy_from_env({"OH_NETWORK_MODE": "bogus"})
+
+
+def test_strict_no_network_rejects_caller_endpoints():
+    with pytest.raises(ValidationError, match="strict-no-network"):
+        WorkspaceNetworkPolicy(
+            mode="strict-no-network",
+            allowed_endpoints=(
+                AllowedEndpoint(destination=ip_network("192.0.2.0/24")),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "dest",
+    ["ff00::/8", "fe80::/10", "::/128"],
+)
+def test_unsafe_ipv6_destinations_rejected(dest):
+    with pytest.raises(ValidationError):
+        AllowedEndpoint(destination=ip_network(dest))
+
+
+def test_legitimate_ipv6_destination_accepted():
+    ep = AllowedEndpoint(destination=ip_network("2001:db8::/32"))
+    assert ep.destination.version == 6
