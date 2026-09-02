@@ -223,3 +223,44 @@ def test_rules_file_is_world_readable_and_directory_is_not(tmp_path, monkeypatch
             return_value=Mock(returncode=0, stdout="", stderr=""),
         ):
             runtime.cleanup()
+
+
+def test_sidecar_receives_the_expected_policy_digest():
+    """The sidecar must be told which policy it is supposed to have applied.
+
+    Without it the entrypoint can only check that *a* ruleset loaded, not that
+    it is the one the host rendered.
+    """
+    import openhands.workspace.docker.egress_runtime as _rt
+    from openhands.workspace.docker.nftables_renderer import policy_digest, render_rules
+
+    policy = WorkspaceNetworkPolicy(mode="no-network")
+    expected = policy_digest(render_rules(policy))
+
+    def fake_exec(cmd, *args, **kwargs):
+        if "network" in cmd and "create" in cmd:
+            return Mock(returncode=0, stdout="netid", stderr="")
+        if "network" in cmd and "inspect" in cmd:
+            return Mock(returncode=0, stdout="172.30.0.0/16 ", stderr="")
+        if "run" in cmd:
+            return Mock(returncode=0, stdout="sidecarid", stderr="")
+        return Mock(returncode=0, stdout="", stderr="")
+
+    with patch(
+        "openhands.workspace.docker.egress_runtime.execute_command",
+        side_effect=fake_exec,
+    ) as mock_exec:
+        runtime = _rt.start_egress_sidecar(policy, host_port=39998)
+        run_cmd = next(
+            c.args[0] for c in mock_exec.call_args_list if "run" in c.args[0]
+        )
+
+    try:
+        assert f"{_rt.POLICY_DIGEST_ENV}={expected}" in run_cmd
+        assert runtime.policy_digest == expected
+    finally:
+        with patch(
+            "openhands.workspace.docker.egress_runtime.execute_command",
+            return_value=Mock(returncode=0, stdout="", stderr=""),
+        ):
+            runtime.cleanup()
