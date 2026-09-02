@@ -17,7 +17,6 @@ cleanup() {
 trap cleanup EXIT
 
 on_signal() {
-    cleanup
     exit 0
 }
 trap on_signal TERM INT HUP
@@ -53,6 +52,13 @@ done
 # The resolver drop must precede the loopback accept, or DNS escapes.
 resolver_line="$(printf '%s\n' "$applied" | grep -n 'daddr 127.0.0.11' | head -1 | cut -d: -f1)"
 loopback_line="$(printf '%s\n' "$applied" | grep -n 'oifname "lo"' | head -1 | cut -d: -f1)"
+# Fail closed: if the resolver drop is absent here the ordering check cannot run.
+# (The required-rule loop above should have already caught this, but this guards
+# against future relaxations of that literal check.)
+if [ -z "$resolver_line" ]; then
+    echo "egress: ordering check failed, resolver drop rule not found" >&2
+    exit 1
+fi
 if [ -n "$loopback_line" ] && [ "$resolver_line" -ge "$loopback_line" ]; then
     echo "egress: resolver drop must precede loopback accept" >&2
     exit 1
