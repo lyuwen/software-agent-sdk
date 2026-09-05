@@ -47,12 +47,75 @@ _ENV_VALIDATION_RETRY = "OH_VALIDATION_RETRY"
 # Opt-in: treat an assistant reply with no tool call as a retryable failure.
 _ENV_EXPECT_TOOLCALL = "OH_EXPECT_TOOLCALL"
 
+# Bash-alias normalization: after this many consecutive unknown-tool errors where
+# the model calls an alias (e.g. "bash") but only the canonical name is offered
+# (e.g. "execute_bash"), rewrite the name in-place so the harness can proceed.
+_DEFAULT_BASH_NORMALIZE_THRESHOLD = 3
+_ENV_BASH_NORMALIZE_THRESHOLD = "OH_BASH_NORMALIZE_THRESHOLD"
+
+# Maps aliased names a model may emit to the canonical tool name it should use.
+_BASH_TOOL_ALIASES: dict[str, str] = {"bash": "execute_bash"}
+
 
 def _max_validation_retries() -> int:
     try:
         return int(os.environ.get(_ENV_VALIDATION_RETRY, _DEFAULT_VALIDATION_RETRIES))
     except (ValueError, TypeError):
         return _DEFAULT_VALIDATION_RETRIES
+
+
+def _bash_normalize_threshold() -> int:
+    try:
+        return int(
+            os.environ.get(_ENV_BASH_NORMALIZE_THRESHOLD, _DEFAULT_BASH_NORMALIZE_THRESHOLD)
+        )
+    except (ValueError, TypeError):
+        return _DEFAULT_BASH_NORMALIZE_THRESHOLD
+
+
+def _normalize_bash_aliases(
+    response: ModelResponse,
+    tools: list[ChatCompletionToolParam] | None,
+) -> bool:
+    """Rewrite aliased tool names in-place when the alias maps to an offered tool.
+
+    Iterates over all tool calls in the response and, for each call whose name is
+    a key in ``_BASH_TOOL_ALIASES``, checks whether the mapped canonical name is
+    actually offered in *tools*.  If so, the call's name is rewritten to the
+    canonical name so the harness can proceed without an unknown-tool error.
+
+    Returns True if at least one name was rewritten, False otherwise.
+    """
+    if not tools:
+        return False
+    known_names = {
+        t["function"]["name"]
+        for t in tools
+        if t.get("type") == "function" and isinstance(t.get("function"), dict)
+    }
+    rewritten = False
+    try:
+        for choice in response.choices or []:
+            message = getattr(choice, "message", None)
+            if message is None:
+                continue
+            for tc in getattr(message, "tool_calls", None) or []:
+                fn = getattr(tc, "function", None)
+                if fn is None:
+                    continue
+                name = getattr(fn, "name", None)
+                if name is None:
+                    continue
+                canonical = _BASH_TOOL_ALIASES.get(name)
+                if canonical and canonical in known_names:
+                    logger.warning(
+                        f"Normalizing aliased tool call '{name}' -> '{canonical}'"
+                    )
+                    fn.name = canonical
+                    rewritten = True
+    except Exception as exc:
+        logger.warning(f"Error normalizing bash tool aliases: {exc}")
+    return rewritten
 
 
 def _check_malformed(response: ModelResponse) -> LLMResponseValidationError | None:
@@ -260,6 +323,8 @@ def validated_litellm_completion(
     own backoff/retry for network, rate-limit, and timeout errors).
     """
     max_retries = _max_validation_retries()
+    normalize_threshold = _bash_normalize_threshold()
+    bash_alias_hits = 0  # consecutive unknown_tool errors caused by a bash alias
 
     for attempt in range(max(max_retries, 1)):
         with warnings.catch_warnings():
@@ -315,6 +380,22 @@ def validated_litellm_completion(
         err = _validate(ret, tools)
         if err is None:
             return ret
+
+        # If the model keeps calling a known alias (e.g. "bash" instead of
+        # "execute_bash"), count the streak and normalize in-place once the
+        # threshold is reached so the harness can continue without error.
+        if err.tag == "unknown_tool":
+            bash_alias_hits += 1
+            if bash_alias_hits >= normalize_threshold:
+                if _normalize_bash_aliases(ret, tools):
+                    logger.warning(
+                        f"Bash-alias normalization applied after"
+                        f" {bash_alias_hits} consecutive unknown_tool errors;"
+                        " returning normalized response"
+                    )
+                    return ret
+        else:
+            bash_alias_hits = 0
 
         remaining = max_retries - attempt - 1
         if remaining > 0:
