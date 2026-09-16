@@ -106,13 +106,26 @@ jobs:
           tags: ${{ steps.tags.outputs.list }}
 
   # ------------------------------------------------------------------
-  # Stage 2: ubuntu:22.04 image — copies the prefix into a real OS.
-  # Uses the just-published mindist image as BASE_IMAGE so both images
-  # always carry the same software snapshot.
+  # Stage 2: runtime image matrix — copies the prefix into a real OS.
+  # Uses the just-published mindist image as BASE_IMAGE so all runtime
+  # images always carry the same software snapshot.
+  #
+  # Alpine is intentionally excluded: the mindist CPython is built
+  # against glibc and will not run on musl-based images.
   # ------------------------------------------------------------------
-  build-ubuntu2204:
+  build-runtime:
     needs: [determine-tags, build-mindist]
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - base_os: ubuntu:22.04
+            tag_suffix: ubuntu2204
+          - base_os: ubuntu:24.04
+            tag_suffix: ubuntu2404
+          - base_os: debian:bookworm-slim
+            tag_suffix: debian-bookworm
     env:
       IMAGE: ghcr.io/${{ github.repository_owner }}/openhands-sdk
       BASE:  ghcr.io/${{ github.repository_owner }}/openhands-sdk-min:${{ needs.determine-tags.outputs.primary_tag }}
@@ -134,10 +147,11 @@ jobs:
         run: |
           PRIMARY="${{ needs.determine-tags.outputs.primary_tag }}"
           EXTRA="${{ needs.determine-tags.outputs.extra_tag }}"
-          TAGS="${IMAGE}:${PRIMARY}-ubuntu2204"
+          SUFFIX="${{ matrix.tag_suffix }}"
+          TAGS="${IMAGE}:${PRIMARY}-${SUFFIX}"
           if [[ -n "$EXTRA" ]]; then
             TAGS="${TAGS}
-          ${IMAGE}:${EXTRA}-ubuntu2204"
+          ${IMAGE}:${EXTRA}-${SUFFIX}"
           fi
           {
             echo "list<<EOF"
@@ -149,8 +163,9 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/ubuntu2204.Dockerfile
+          file: docker/runtime.Dockerfile
           push: true
           tags: ${{ steps.tags.outputs.list }}
           build-args: |
             BASE_IMAGE=${{ env.BASE }}
+            BASE_OS=${{ matrix.base_os }}
