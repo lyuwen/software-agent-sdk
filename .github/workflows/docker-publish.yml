@@ -1,0 +1,156 @@
+name: Build and Publish Docker Images
+
+on:
+  push:
+    tags:
+      - 'v*'
+  schedule:
+    # nightly at 03:17 UTC
+    - cron: '17 3 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ------------------------------------------------------------------
+  # Compute image tags once; subsequent jobs consume the outputs.
+  #
+  # Tag strategy:
+  #   tag release    → <tag> + latest
+  #   nightly        → nightly
+  #   workflow_dispatch → HEAD git tag if present, else "manual"
+  # ------------------------------------------------------------------
+  determine-tags:
+    runs-on: ubuntu-latest
+    outputs:
+      # Newline-separated full image refs for docker/build-push-action.
+      # Computed separately for each image name; jobs substitute their
+      # own image name using primary_tag / extra_tag below.
+      primary_tag: ${{ steps.compute.outputs.primary_tag }}
+      extra_tag:   ${{ steps.compute.outputs.extra_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history to resolve tags
+
+      - name: Compute image tags
+        id: compute
+        run: |
+          case "${{ github.event_name }}" in
+            push)
+              echo "primary_tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+              echo "extra_tag=latest"                   >> "$GITHUB_OUTPUT"
+              ;;
+            schedule)
+              echo "primary_tag=nightly" >> "$GITHUB_OUTPUT"
+              echo "extra_tag="          >> "$GITHUB_OUTPUT"
+              ;;
+            workflow_dispatch)
+              HEAD_TAG=$(git describe --exact-match --tags HEAD 2>/dev/null || true)
+              if [[ -n "$HEAD_TAG" ]]; then
+                echo "primary_tag=$HEAD_TAG" >> "$GITHUB_OUTPUT"
+              else
+                echo "primary_tag=manual"    >> "$GITHUB_OUTPUT"
+              fi
+              echo "extra_tag=" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+  # ------------------------------------------------------------------
+  # Stage 1: scratch/mindist image — the self-contained Python env.
+  # Build context is the SDK repo root so the bind-mount in the
+  # Dockerfile can reach the four package directories.
+  # ------------------------------------------------------------------
+  build-mindist:
+    needs: determine-tags
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/openhands-sdk-min
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assemble tag list
+        id: tags
+        run: |
+          PRIMARY="${{ needs.determine-tags.outputs.primary_tag }}"
+          EXTRA="${{ needs.determine-tags.outputs.extra_tag }}"
+          TAGS="${IMAGE}:${PRIMARY}"
+          if [[ -n "$EXTRA" ]]; then
+            TAGS="${TAGS}
+          ${IMAGE}:${EXTRA}"
+          fi
+          {
+            echo "list<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/mindist.Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+
+  # ------------------------------------------------------------------
+  # Stage 2: ubuntu:22.04 image — copies the prefix into a real OS.
+  # Uses the just-published mindist image as BASE_IMAGE so both images
+  # always carry the same software snapshot.
+  # ------------------------------------------------------------------
+  build-ubuntu2204:
+    needs: [determine-tags, build-mindist]
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/openhands-sdk
+      BASE:  ghcr.io/${{ github.repository_owner }}/openhands-sdk-min:${{ needs.determine-tags.outputs.primary_tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assemble tag list
+        id: tags
+        run: |
+          PRIMARY="${{ needs.determine-tags.outputs.primary_tag }}"
+          EXTRA="${{ needs.determine-tags.outputs.extra_tag }}"
+          TAGS="${IMAGE}:${PRIMARY}-ubuntu2204"
+          if [[ -n "$EXTRA" ]]; then
+            TAGS="${TAGS}
+          ${IMAGE}:${EXTRA}-ubuntu2204"
+          fi
+          {
+            echo "list<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/ubuntu2204.Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          build-args: |
+            BASE_IMAGE=${{ env.BASE }}
