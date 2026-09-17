@@ -1,18 +1,14 @@
 """Flex workspace using the agent-plugin volume mount pattern."""
 
-import os
 import re
-import threading
 import uuid
-from typing import Any
 
 from pydantic import Field, PrivateAttr
 
 from openhands.sdk.logger import get_logger
 from openhands.sdk.utils.command import execute_command
-from openhands.sdk.workspace import RemoteWorkspace
 
-from .workspace import DockerWorkspace, check_port_available, find_available_tcp_port
+from .workspace import ContainerLaunchSpec, DockerWorkspace
 
 
 logger = get_logger(__name__)
@@ -43,23 +39,32 @@ def _detect_glibc_version(image: str, platform: str = "linux/amd64") -> float | 
     if pull_proc.returncode != 0:
         logger.warning(
             "docker pull failed for %s (exit %d): %s",
-            image, pull_proc.returncode, pull_proc.stderr,
+            image,
+            pull_proc.returncode,
+            pull_proc.stderr,
         )
 
     proc = execute_command(
         [
-            "docker", "run", "--rm",
-            "--platform", platform,
-            "--entrypoint", "",
+            "docker",
+            "run",
+            "--rm",
+            "--platform",
+            platform,
+            "--entrypoint",
+            "",
             image,
-            "ldd", "--version",
+            "ldd",
+            "--version",
         ],
         timeout=30,
     )
     if proc.returncode != 0:
         logger.warning(
             "glibc detection failed for %s (exit %d): %s",
-            image, proc.returncode, proc.stderr,
+            image,
+            proc.returncode,
+            proc.stderr,
         )
         return None
 
@@ -99,8 +104,11 @@ def _get_base_image_path(image: str) -> str:
     """
     proc = execute_command(
         [
-            "docker", "image", "inspect",
-            "--format", '{{range .Config.Env}}{{println .}}{{end}}',
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            "{{range .Config.Env}}{{println .}}{{end}}",
             image,
         ],
         timeout=15,
@@ -150,43 +158,13 @@ class FlexWorkspace(DockerWorkspace):
         """Return the base image directly — no build step needed."""
         return self.base_image
 
-    def _start_container(self, image: str, context: Any) -> None:
-        """Start container with agent-plugin volume mounted.
+    def _prepare_launch(self, image: str) -> ContainerLaunchSpec:
+        """Stage the agent-plugin volume and the glibc-matched environment.
 
-        Same lifecycle as parent but adds:
-        - A plugin data container (``--volumes-from``)
-        - Agent-server environment variables
-        - Entrypoint override to launch the agent server
+        Only image-specific work happens here. Container startup, egress
+        sidecar attachment and rollback stay in DockerWorkspace, so this
+        launcher cannot drift away from the network boundary again.
         """
-        self._image_name = image
-
-        # Determine port
-        if self.host_port is None:
-            self.host_port = find_available_tcp_port()
-        else:
-            self.host_port = int(self.host_port)
-
-        if not check_port_available(self.host_port):
-            raise RuntimeError(f"Port {self.host_port} is not available")
-
-        if self.extra_ports:
-            if not check_port_available(self.host_port + 1):
-                raise RuntimeError(
-                    f"Port {self.host_port + 1} is not available for VSCode"
-                )
-            if not check_port_available(self.host_port + 2):
-                raise RuntimeError(
-                    f"Port {self.host_port + 2} is not available for VNC"
-                )
-
-        # Ensure docker is available
-        docker_ver = execute_command(["docker", "version"]).returncode
-        if docker_ver != 0:
-            raise RuntimeError(
-                "Docker is not available. Please install and start "
-                "Docker Desktop/daemon."
-            )
-
         # Detect glibc version and select matching variant
         glibc_ver = _detect_glibc_version(image, self.platform)
         variant = _select_variant(glibc_ver)
@@ -200,7 +178,8 @@ class FlexWorkspace(DockerWorkspace):
             fallback_lib = "/agent-server/lib"
             logger.info(
                 "Using glibc variant '%s' (glibc %.2f) for bin/lib paths",
-                variant, glibc_ver,
+                variant,
+                glibc_ver,
             )
         else:
             bin_path = "/agent-server/bin"
@@ -239,112 +218,45 @@ class FlexWorkspace(DockerWorkspace):
             )
         logger.info(f"Created plugin data container: {self._plugin_container_name}")
 
-        # Prepare Docker run flags
-        flags: list[str] = []
+        return ContainerLaunchSpec(
+            extra_flags=[
+                "--volumes-from",
+                self._plugin_container_name,
+                "-e",
+                f"PATH={combined_path}",
+                "-e",
+                f"LD_LIBRARY_PATH={combined_lib}",
+                "-e",
+                "UV_PYTHON_INSTALL_DIR=/agent-server/uv-managed-python",
+                "-w",
+                "/",
+            ],
+            entrypoint=["/agent-server/.venv/bin/python"],
+            command=[
+                "-m",
+                "openhands.agent_server",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "8000",
+            ],
+        )
 
-        # Agent-plugin volume
-        flags += ["--volumes-from", self._plugin_container_name]
-
-        # Agent-server environment variables
-        flags += [
-            "-e", f"PATH={combined_path}",
-            "-e", f"LD_LIBRARY_PATH={combined_lib}",
-            "-e", "UV_PYTHON_INSTALL_DIR=/agent-server/uv-managed-python",
-        ]
-
-        # Forward environment variables
-        for key in self.forward_env:
-            if key in os.environ:
-                flags += ["-e", f"{key}={os.environ[key]}"]
-
-        # Forward environment variables with OH_ prefix
-        for key, val in os.environ.items():
-            if key.startswith("OH_") and key not in self.forward_env:
-                flags += ["-e", f"{key}={val}"]
-
-        if self.mount_dir:
-            mount_path = "/workspace"
-            flags += ["-v", f"{self.mount_dir}:{mount_path}"]
-            logger.info(
-                f"Mounting host dir {self.mount_dir} to container path {mount_path}"
-            )
-
-        if self.bind_volumes:
-            for volume in self.bind_volumes:
-                flags += ["-v", volume]
-
-        ports = ["-p", f"{self.host_port}:8000"]
-        if self.extra_ports:
-            ports += [
-                "-p",
-                f"{self.host_port + 1}:8001",  # VSCode
-                "-p",
-                f"{self.host_port + 2}:8002",  # Desktop VNC
-            ]
-        flags += ports
-
-        # Set working directory to / so the agent server uses absolute paths
-        flags += ["-w", "/"]
-
-        # Add GPU support if enabled
-        if self.enable_gpu:
-            flags += ["--gpus", "all"]
-
-        # Set memory limit per instance
-        flags += ["--memory=14g"]
-
-        # Run container with entrypoint override for agent server
-        run_cmd = [
-            "docker",
-            "run",
-            "-d",
-            "--platform",
-            self.platform,
-            "--rm",
-            "--name",
-            f"agent-server-{uuid.uuid4()}",
-            *flags,
-            "--entrypoint",
-            "/agent-server/.venv/bin/python",
-            image,
-            "-m",
-            "openhands.agent_server",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            "8000",
-        ]
-        proc = execute_command(run_cmd)
-        if proc.returncode != 0:
-            raise RuntimeError(f"Failed to run docker container: {proc.stderr}")
-
-        self._container_id = proc.stdout.strip()
-        logger.info(f"Started container: {self._container_id}")
-
-        # Optionally stream logs in background
-        if self.detach_logs:
-            self._logs_thread = threading.Thread(
-                target=self._stream_docker_logs, daemon=True
-            )
-            self._logs_thread.start()
-
-        # Set host for RemoteWorkspace to use
-        object.__setattr__(self, "host", f"http://localhost:{self.host_port}")
-        object.__setattr__(self, "api_key", None)
-
-        # Wait for container to be healthy
-        self._wait_for_health()
-        logger.info(f"Docker workspace is ready at {self.host}")
-
-        # Initialize the RemoteWorkspace (grandparent) with the container URL
-        RemoteWorkspace.model_post_init(self, context)
-
-    def cleanup(self) -> None:
-        """Stop container and remove the plugin data container."""
-        super().cleanup()
+    def _release_launch_artifacts(self) -> None:
+        """Remove the plugin data container. Idempotent."""
         if self._plugin_container_name:
             logger.info(
                 f"Removing plugin data container: {self._plugin_container_name}"
             )
             execute_command(["docker", "rm", "-f", self._plugin_container_name])
             self._plugin_container_name = None
+
+    def cleanup(self) -> None:
+        """Stop the container and remove the plugin data container.
+
+        The base cleanup already calls ``_release_launch_artifacts()``; this
+        override remains only to document the behaviour and stays correct
+        because that hook is idempotent.
+        """
+        super().cleanup()
+        self._release_launch_artifacts()
