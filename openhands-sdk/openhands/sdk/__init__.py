@@ -9,6 +9,7 @@ from openhands.sdk.context import (
 )
 from openhands.sdk.context.condenser import (
     LLMSummarizingCondenser,
+    ReplaySummarizingCondenser,
 )
 from openhands.sdk.conversation import (
     BaseConversation,
@@ -97,6 +98,7 @@ __all__ = [
     "LLMConvertibleEvent",
     "AgentContext",
     "LLMSummarizingCondenser",
+    "ReplaySummarizingCondenser",
     "FileStore",
     "LocalFileStore",
     "Plugin",
