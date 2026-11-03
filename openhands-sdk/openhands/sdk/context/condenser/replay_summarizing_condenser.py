@@ -233,13 +233,20 @@ class ReplaySummarizingCondenser(RollingCondenser):
             return message
         return message.model_copy(update={"content": content})
 
-    def _summarize(self, view: View, start: int, end: int) -> tuple[str, str]:
-        """Ask the summarizer LLM for a checkpoint and return (text, response id)."""
+    def _summarize(
+        self, view: View, start: int, end: int
+    ) -> tuple[str, str, list[Message], Message]:
+        """Ask the summarizer LLM for a checkpoint.
+
+        Returns:
+            A tuple of the summary text, the response id, the exact messages sent
+            to the summarizer, and the summarizer's response message.
+        """
         messages = self._build_summarization_messages(view, start, end)
         response = self.llm.completion(messages=messages)
         for block in response.message.content:
             if isinstance(block, TextContent) and block.text.strip():
-                return block.text, response.id
+                return block.text, response.id, messages, response.message
         raise NoCondensationAvailableException(
             "Summarization LLM returned no text content."
         )
@@ -270,7 +277,9 @@ class ReplaySummarizingCondenser(RollingCondenser):
                 for_request=for_request,
             )
             forgotten_events = list(view.events[start:end])
-            summary, response_id = self._summarize(view, start, end)
+            summary, response_id, request_messages, response_message = self._summarize(
+                view, start, end
+            )
             framed_summary = self._frame_summary(summary)
 
             summary_tokens = get_total_token_count(
@@ -283,6 +292,8 @@ class ReplaySummarizingCondenser(RollingCondenser):
                     summary=framed_summary,
                     summary_offset=start,
                     llm_response_id=response_id,
+                    request_messages=request_messages,
+                    response_message=response_message,
                 )
             logger.warning(
                 "Replay summary did not shrink its source (%d >= %d tokens); "

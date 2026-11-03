@@ -273,6 +273,22 @@ def test_summarization_replays_real_messages_and_pinned_prefix() -> None:
     assert long_tool_output in replayed_text
 
 
+def test_condensation_records_summarizer_input_and_output() -> None:
+    condenser_llm = make_condenser_llm("summary text")
+    condenser = ReplaySummarizingCondenser(llm=condenser_llm)
+    agent_llm = make_agent_llm()
+
+    events = [message_event("A" * CHARS_PER_EVENT) for _ in range(100)]
+    result = condenser.condense(View.from_events(events), agent_llm=agent_llm)
+
+    assert isinstance(result, Condensation)
+    # The exact summarizer prompt and response are recoverable from the event.
+    assert result.request_messages == replayed_messages(condenser_llm)
+    assert result.response_message is not None
+    assert result.response_message.role == "assistant"
+    assert message_text(result.response_message) == "summary text"
+
+
 def test_previous_checkpoint_is_merged_into_next_summary() -> None:
     condenser_llm = make_condenser_llm("FIRST", "SECOND")
     condenser = ReplaySummarizingCondenser(llm=condenser_llm)
