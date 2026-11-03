@@ -30,6 +30,21 @@ class Condensation(Event):
             "Completion or Response ID of the LLM response that generated this event"
         ),
     )
+    request_messages: list[Message] | None = Field(
+        default=None,
+        description=(
+            "Messages sent to the summarizer LLM to produce this condensation, "
+            "recorded verbatim so the compaction input is recoverable from the "
+            "event log. None when the producing condenser does not record it."
+        ),
+    )
+    response_message: Message | None = Field(
+        default=None,
+        description=(
+            "Message returned by the summarizer LLM; its text content is the "
+            "summary. None when the producing condenser does not record it."
+        ),
+    )
 
     source: SourceType = "environment"
 
