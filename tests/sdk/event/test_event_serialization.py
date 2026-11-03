@@ -149,12 +149,20 @@ def test_condensation_serialization() -> None:
         summary="This is a summary",
         forgotten_event_ids=["event1", "event2", "event3", "event4", "event5"],
         llm_response_id="condensation_response_1",
+        request_messages=[
+            Message(role="user", content=[TextContent(text="summarize this")])
+        ],
+        response_message=Message(
+            role="assistant", content=[TextContent(text="This is a summary")]
+        ),
     )
 
     # Serialize
     json_data = event.model_dump_json()
     deserialized = Condensation.model_validate_json(json_data)
     assert deserialized == event
+    assert deserialized.request_messages == event.request_messages
+    assert deserialized.response_message == event.response_message
 
 
 def test_condensation_request_serialization() -> None:

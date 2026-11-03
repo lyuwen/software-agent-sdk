@@ -160,8 +160,19 @@ def test_condense_returns_condensation_when_needed(mock_llm: LLM) -> None:
     assert result.summary_offset == keep_first + 1
     assert len(result.forgotten_event_ids) > 0
 
+    # The summarizer input and output are recorded so the compaction trace is
+    # recoverable from the event log alone.
+    completion_mock = cast(MagicMock, mock_llm.completion)
+    sent_messages = completion_mock.call_args[1]["messages"]
+    assert result.request_messages == sent_messages
+    assert result.response_message is not None
+    assert result.response_message.role == "assistant"
+    assert result.response_message.content == [
+        TextContent(text="Summary of forgotten events")
+    ]
+
     # LLM should be called once
-    cast(MagicMock, mock_llm.completion).assert_called_once()
+    completion_mock.assert_called_once()
 
 
 def test_get_condensation_with_previous_summary(mock_llm: LLM) -> None:

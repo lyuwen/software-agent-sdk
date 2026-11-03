@@ -180,6 +180,8 @@ class LLMSummarizingCondenser(RollingCondenser):
             summary=summary,
             summary_offset=summary_offset,
             llm_response_id=llm_response.id,
+            request_messages=messages,
+            response_message=llm_response.message,
         )
 
     def _get_forgotten_events(
