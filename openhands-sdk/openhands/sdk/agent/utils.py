@@ -11,6 +11,9 @@ from typing import (
 )
 
 from openhands.sdk.context.condenser.base import CondenserBase
+from openhands.sdk.context.tool_result_pruner import (
+    maybe_prune_tool_result_messages,
+)
 from openhands.sdk.context.view import View
 from openhands.sdk.conversation.types import ConversationTokenCallbackType
 from openhands.sdk.event.base import Event, LLMConvertibleEvent
@@ -181,7 +184,10 @@ def prepare_llm_messages(
     if additional_messages:
         messages.extend(additional_messages)
 
-    return messages
+    # Bound oversized tool results for this LLM request only. The conversation
+    # history keeps full-fidelity output. Opt in with OH_TOOL_RESULT_PRUNER=1;
+    # budgets come from the OH_TOOL_RESULT_PRUNER_* environment variables.
+    return maybe_prune_tool_result_messages(messages)
 
 
 def make_llm_completion(

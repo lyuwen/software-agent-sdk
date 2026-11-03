@@ -1,4 +1,5 @@
 import json
+from typing import Any
 
 from pydantic import Field
 from rich.text import Text
@@ -16,6 +17,17 @@ class SystemPromptEvent(LLMConvertibleEvent):
     system_prompt: TextContent = Field(..., description="The system prompt text")
     tools: list[ToolDefinition] = Field(
         ..., description="List of tools as ToolDefinition objects"
+    )
+    tool_result_pruning: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Tool-result pruning policy that was active when the conversation "
+            "started: {'enabled': False} or {'enabled': True, 'threshold_chars': "
+            "int, 'head_chars': int, 'tail_chars': int}. Recorded so exported "
+            "trajectories reproduce the pruning the model actually saw instead "
+            "of re-reading the exporter's environment. None on events created "
+            "before the field existed."
+        ),
     )
 
     @property
