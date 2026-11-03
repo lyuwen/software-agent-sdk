@@ -10,6 +10,7 @@ from openhands.sdk.agent.utils import (
     make_llm_completion,
     prepare_llm_messages,
 )
+from openhands.sdk.context.tool_result_pruner import config_from_env, is_enabled
 from openhands.sdk.conversation import (
     ConversationCallbackType,
     ConversationState,
@@ -109,6 +110,18 @@ class Agent(AgentBase):
             event for event in state.events if isinstance(event, LLMConvertibleEvent)
         ]
         if len(llm_convertible_messages) == 0:
+            # Record the pruning policy the agent loop will apply, so the
+            # exported trajectory can reproduce it without reading the
+            # exporter's environment.
+            tool_result_pruning: dict[str, object] = {"enabled": False}
+            if is_enabled():
+                pruning_config = config_from_env()
+                tool_result_pruning = {
+                    "enabled": True,
+                    "threshold_chars": pruning_config.threshold_chars,
+                    "head_chars": pruning_config.head_chars,
+                    "tail_chars": pruning_config.tail_chars,
+                }
             # Prepare system message
             event = SystemPromptEvent(
                 source="agent",
@@ -117,6 +130,7 @@ class Agent(AgentBase):
                 # OpenAI format with security_risk parameter during LLM completion.
                 # See make_llm_completion() in agent/utils.py for details.
                 tools=list(self.tools_map.values()),
+                tool_result_pruning=tool_result_pruning,
             )
             on_event(event)
 

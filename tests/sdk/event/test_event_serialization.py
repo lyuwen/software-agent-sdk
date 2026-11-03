@@ -52,12 +52,20 @@ def test_event_base_serialization() -> None:
 def test_system_prompt_event_serialization() -> None:
     """Test SystemPromptEvent serialization/deserialization."""
     event = SystemPromptEvent(
-        system_prompt=TextContent(text="You are a helpful assistant"), tools=[]
+        system_prompt=TextContent(text="You are a helpful assistant"),
+        tools=[],
+        tool_result_pruning={
+            "enabled": True,
+            "threshold_chars": 1000,
+            "head_chars": 100,
+            "tail_chars": 50,
+        },
     )
 
     json_data = event.model_dump_json()
     deserialized = SystemPromptEvent.model_validate_json(json_data)
     assert deserialized == event
+    assert deserialized.tool_result_pruning == event.tool_result_pruning
 
 
 def test_action_event_serialization() -> None:
