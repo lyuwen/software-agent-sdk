@@ -307,6 +307,7 @@ class FlexWorkspace(DockerWorkspace):
             "--entrypoint",
             "/agent-server/.venv/bin/python",
             image,
+            "-E",
             "-m",
             "openhands.agent_server",
             "--host",
